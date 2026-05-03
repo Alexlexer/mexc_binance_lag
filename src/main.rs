@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::str::FromStr;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::CorsLayer;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 
@@ -78,12 +78,12 @@ struct Config {
     telegram_bot_token: String,
     #[serde(default)]
     telegram_chat_id: String,
-    #[serde(default = "default_telegram_report_interval_hours")]
-    telegram_report_interval_hours: u64,
     #[serde(default)]
     telegram_login_password: String,
     #[serde(default = "default_telegram_subscribers_path")]
     telegram_subscribers_path: String,
+    #[serde(default = "default_alert_diff_bps")]
+    alert_diff_bps: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,12 +135,22 @@ struct LagRecord {
     mexc_recv_ts_ms: i64,
 }
 
+
+#[derive(Debug, Clone)]
+struct ActiveDiffAlert {
+    started_ms: i64,
+    direction: String,
+    start_diff_bps: Decimal,
+    start_diff_usdt: Decimal,
+    max_abs_diff_bps: Decimal,
+}
 #[derive(Default)]
 struct SymbolState {
     last_binance: Option<QuoteUpdate>,
     last_mexc: Option<QuoteUpdate>,
     pending: Option<PendingEvent>,
     last_event_ts_ms: i64,
+    active_diff_alert: Option<ActiveDiffAlert>,
 }
 
 #[derive(Default, Clone)]
@@ -300,28 +310,15 @@ async fn main() -> Result<()> {
     let mut stats = Stats::default();
     let mut stats_tick = tokio::time::interval(Duration::from_secs(config.stats_interval_secs));
     let mut dashboard_tick = tokio::time::interval(Duration::from_secs(1));
-    let report_secs = config.telegram_report_interval_hours.max(1) * 60 * 60;
-    let mut telegram_tick = tokio::time::interval_at(
-        Instant::now() + Duration::from_secs(report_secs),
-        Duration::from_secs(report_secs),
-    );
-    telegram_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             Some(update) = rx.recv() => {
-                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv)?;
+                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv).await?;
             }
             _ = dashboard_tick.tick() => {
                 let snapshot = build_dashboard_snapshot(&config, &states, &stats);
                 *dashboard.write().await = snapshot;
-            }
-            _ = telegram_tick.tick() => {
-                let snapshot = build_dashboard_snapshot(&config, &states, &stats);
-                let config_snapshot = config.clone();
-                tokio::spawn(async move {
-                    let _ = send_telegram_report(&config_snapshot, &snapshot).await;
-                });
             }
             _ = stats_tick.tick() => {
                 expire_old_pending(&config, &mut states, &mut stats);
@@ -350,12 +347,12 @@ fn default_trade_notional_usdt() -> Decimal {
     Decimal::from(300)
 }
 
-fn default_telegram_report_interval_hours() -> u64 {
-    5
-}
-
 fn default_telegram_subscribers_path() -> String {
     "telegram_subscribers.json".to_string()
+}
+
+fn default_alert_diff_bps() -> Decimal {
+    Decimal::new(5, 1)
 }
 
 fn load_config() -> Result<Config> {
@@ -426,7 +423,7 @@ fn open_csv(path: &str) -> Result<File> {
     Ok(file)
 }
 
-fn handle_quote(
+async fn handle_quote(
     update: QuoteUpdate,
     config: &Config,
     states: &mut HashMap<String, SymbolState>,
@@ -533,9 +530,89 @@ fn handle_quote(
         }
     }
 
+    check_price_diff_alert(&update.symbol, config, state).await;
+
     Ok(())
 }
 
+async fn check_price_diff_alert(symbol: &str, config: &Config, state: &mut SymbolState) {
+    let (Some(binance), Some(mexc)) = (state.last_binance.as_ref(), state.last_mexc.as_ref()) else {
+        return;
+    };
+    if config.alert_diff_bps <= Decimal::ZERO {
+        return;
+    }
+
+    let b_mid = binance.mid();
+    let m_mid = mexc.mid();
+    if b_mid <= Decimal::ZERO || m_mid <= Decimal::ZERO {
+        return;
+    }
+
+    let diff_usdt = m_mid - b_mid;
+    let diff_bps = diff_usdt / b_mid * Decimal::from(10_000);
+    let abs_diff_bps = diff_bps.abs();
+    let now = now_ms();
+
+    if abs_diff_bps >= config.alert_diff_bps {
+        match state.active_diff_alert.as_mut() {
+            Some(active) => {
+                if abs_diff_bps > active.max_abs_diff_bps {
+                    active.max_abs_diff_bps = abs_diff_bps;
+                }
+            }
+            None => {
+                let direction = if diff_usdt > Decimal::ZERO {
+                    "MEXC выше Binance".to_string()
+                } else {
+                    "MEXC ниже Binance".to_string()
+                };
+                state.active_diff_alert = Some(ActiveDiffAlert {
+                    started_ms: now,
+                    direction: direction.clone(),
+                    start_diff_bps: diff_bps,
+                    start_diff_usdt: diff_usdt,
+                    max_abs_diff_bps: abs_diff_bps,
+                });
+                let text = format!(
+                    "Найдена разница {symbol}\n{direction}\nBinance: {b}\nMEXC: {m}\nРазница: {du} USDT / {db} bps\nПорог: {thr} bps",
+                    symbol = symbol,
+                    direction = direction,
+                    b = b_mid.round_dp(6),
+                    m = m_mid.round_dp(6),
+                    du = diff_usdt.round_dp(6),
+                    db = diff_bps.round_dp(3),
+                    thr = config.alert_diff_bps,
+                );
+                send_telegram_to_subscribers(config, &text).await;
+            }
+        }
+    } else if let Some(active) = state.active_diff_alert.take() {
+        let duration_ms = now - active.started_ms;
+        let text = format!(
+            "Разница закрылась {symbol}\nНаправление: {direction}\nДержалась: {secs:.2} сек\nСтарт: {start_usdt} USDT / {start_bps} bps\nМакс: {max_bps} bps\nФинал: {final_usdt} USDT / {final_bps} bps",
+            symbol = symbol,
+            direction = active.direction,
+            secs = duration_ms as f64 / 1000.0,
+            start_usdt = active.start_diff_usdt.round_dp(6),
+            start_bps = active.start_diff_bps.round_dp(3),
+            max_bps = active.max_abs_diff_bps.round_dp(3),
+            final_usdt = diff_usdt.round_dp(6),
+            final_bps = diff_bps.round_dp(3),
+        );
+        send_telegram_to_subscribers(config, &text).await;
+    }
+}
+
+async fn send_telegram_to_subscribers(config: &Config, text: &str) {
+    if config.telegram_bot_token.is_empty() {
+        return;
+    }
+    let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+    for chat_id in subscribers {
+        let _ = telegram_send_message(config, &chat_id, text).await;
+    }
+}
 fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
     let now = now_ms();
     for (symbol, state) in states.iter_mut() {
@@ -1172,45 +1249,6 @@ async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Re
     Ok(())
 }
 
-async fn send_telegram_report(config: &Config, snapshot: &DashboardSnapshot) -> Result<()> {
-    if config.telegram_bot_token.is_empty() {
-        return Ok(());
-    }
-    let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
-    if subscribers.is_empty() {
-        return Ok(());
-    }
-
-    let mut text = String::new();
-    text.push_str("Отчет MEXC Lag Monitor\n");
-    text.push_str(&format!("Обновлено: {}\n", snapshot.updated_at));
-    text.push_str(&format!("{}\n", snapshot.summary));
-    text.push_str(&format!(
-        "Порог: impulse {} bps, confirm {} bps, max lag {} ms\n\n",
-        snapshot.impulse_bps, snapshot.confirm_bps, snapshot.max_lag_ms
-    ));
-
-    for row in &snapshot.symbols {
-        text.push_str(&format!(
-            "{}: events={}, avg={}ms, p95={}ms, gross={}bps, net fee={}bps, net 0 fee={}bps, pnl fee={} USDT, pnl 0 fee={} USDT\n",
-            row.symbol,
-            row.matched,
-            row.avg_lag_ms.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string()),
-            row.p95_lag_ms.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string()),
-            row.gross_bps.clone().unwrap_or_else(|| "-".to_string()),
-            row.net_fee_bps.clone().unwrap_or_else(|| "-".to_string()),
-            row.net_zero_fee_bps.clone().unwrap_or_else(|| "-".to_string()),
-            row.pnl_fee_usdt.clone().unwrap_or_else(|| "-".to_string()),
-            row.pnl_zero_fee_usdt.clone().unwrap_or_else(|| "-".to_string()),
-        ));
-    }
-
-    for chat_id in subscribers {
-        let _ = telegram_send_message(config, &chat_id, &text).await;
-    }
-    Ok(())
-}
-
 async fn run_telegram_login_bot(config: Config) {
     if config.telegram_bot_token.is_empty() || config.telegram_login_password.is_empty() {
         return;
@@ -1279,6 +1317,11 @@ async fn run_telegram_login_bot(config: Config) {
         sleep(Duration::from_secs(2)).await;
     }
 }
+
+
+
+
+
 
 
 

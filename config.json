@@ -19,7 +19,7 @@
   "trade_notional_usdt": "300",
   "telegram_bot_token": "",
   "telegram_chat_id": "",
-  "telegram_report_interval_hours": 2,
   "telegram_login_password": "",
-  "telegram_subscribers_path": "telegram_subscribers.json"
+  "telegram_subscribers_path": "telegram_subscribers.json",
+  "alert_diff_bps": "0.5"
 }
