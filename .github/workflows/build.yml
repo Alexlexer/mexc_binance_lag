@@ -1,0 +1,51 @@
+name: build-mexc-lag
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            artifact: mexc_lag-linux-x64
+            bin: target/release/mexc_lag
+          - name: macos-arm64
+            os: macos-14
+            artifact: mexc_lag-macos-arm64
+            bin: target/release/mexc_lag
+          - name: macos-x64
+            os: macos-13
+            artifact: mexc_lag-macos-x64
+            bin: target/release/mexc_lag
+          - name: windows-x64
+            os: windows-latest
+            artifact: mexc_lag-windows-x64
+            bin: target/release/mexc_lag.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.bin }}" "dist/"
+          cp config.json README.md "dist/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*

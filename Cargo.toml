@@ -1,0 +1,21 @@
+[package]
+name = "mexc_lag"
+version = "0.1.0"
+edition = "2021"
+description = "Binance -> MEXC futures lag monitor"
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.35", features = ["serde"] }
+rust_decimal_macros = "1.35"
+url = "2.5"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+
