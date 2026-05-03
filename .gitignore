@@ -7,3 +7,5 @@ telegram_config.json
 
 telegram_subscribers.json
 
+.cargo/config.toml
+
