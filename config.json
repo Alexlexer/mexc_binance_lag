@@ -46,7 +46,7 @@
   "impulse_bps": "0.1",
   "confirm_bps": "0.1",
   "impulse_window_ms": 1000,
-  "max_lag_ms": 2500,
+  "max_lag_ms": 100,
   "event_cooldown_ms": 1500,
   "stats_interval_secs": 10,
   "csv_path": "lag_events.csv",
