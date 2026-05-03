@@ -3,3 +3,7 @@ lag_events.csv
 stats_snapshots.csv
 slippage_events.csv
 *.log
+telegram_config.json
+
+telegram_subscribers.json
+

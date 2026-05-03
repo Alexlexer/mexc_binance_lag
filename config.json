@@ -16,5 +16,10 @@
   "stats_csv_path": "stats_snapshots.csv",
   "slippage_csv_path": "slippage_events.csv",
   "mexc_taker_fee_bps": "6.0",
-  "trade_notional_usdt": "300"
+  "trade_notional_usdt": "300",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "telegram_report_interval_hours": 5,
+  "telegram_login_password": "",
+  "telegram_subscribers_path": "telegram_subscribers.json"
 }

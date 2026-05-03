@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::str::FromStr;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::CorsLayer;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 
@@ -72,6 +72,16 @@ struct Config {
     mexc_taker_fee_bps: Decimal,
     #[serde(default = "default_trade_notional_usdt")]
     trade_notional_usdt: Decimal,
+    #[serde(default)]
+    telegram_bot_token: String,
+    #[serde(default)]
+    telegram_chat_id: String,
+    #[serde(default = "default_telegram_report_interval_hours")]
+    telegram_report_interval_hours: u64,
+    #[serde(default)]
+    telegram_login_password: String,
+    #[serde(default = "default_telegram_subscribers_path")]
+    telegram_subscribers_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +280,7 @@ async fn main() -> Result<()> {
     let config = load_config()?;
     let dashboard = Arc::new(RwLock::new(DashboardSnapshot::default()));
     tokio::spawn(run_dashboard(dashboard.clone()));
+    tokio::spawn(run_telegram_login_bot(config.clone()));
     open_dashboard_in_browser();
 
     let (tx, mut rx) = mpsc::channel::<QuoteUpdate>(20_000);
@@ -287,6 +298,12 @@ async fn main() -> Result<()> {
     let mut stats = Stats::default();
     let mut stats_tick = tokio::time::interval(Duration::from_secs(config.stats_interval_secs));
     let mut dashboard_tick = tokio::time::interval(Duration::from_secs(1));
+    let report_secs = config.telegram_report_interval_hours.max(1) * 60 * 60;
+    let mut telegram_tick = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(report_secs),
+        Duration::from_secs(report_secs),
+    );
+    telegram_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -296,6 +313,13 @@ async fn main() -> Result<()> {
             _ = dashboard_tick.tick() => {
                 let snapshot = build_dashboard_snapshot(&config, &states, &stats);
                 *dashboard.write().await = snapshot;
+            }
+            _ = telegram_tick.tick() => {
+                let snapshot = build_dashboard_snapshot(&config, &states, &stats);
+                let config_snapshot = config.clone();
+                tokio::spawn(async move {
+                    let _ = send_telegram_report(&config_snapshot, &snapshot).await;
+                });
             }
             _ = stats_tick.tick() => {
                 expire_old_pending(&config, &mut states, &mut stats);
@@ -324,9 +348,42 @@ fn default_trade_notional_usdt() -> Decimal {
     Decimal::from(300)
 }
 
+fn default_telegram_report_interval_hours() -> u64 {
+    5
+}
+
+fn default_telegram_subscribers_path() -> String {
+    "telegram_subscribers.json".to_string()
+}
+
 fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string("config.json").context("read config.json")?;
-    let config: Config = serde_json::from_str(&text).context("parse config.json")?;
+    let mut config: Config = serde_json::from_str(&text).context("parse config.json")?;
+
+    if let Ok(local_text) = std::fs::read_to_string("telegram_config.json") {
+        if let Ok(local) = serde_json::from_str::<serde_json::Value>(&local_text) {
+            if let Some(v) = local.get("telegram_bot_token").and_then(|x| x.as_str()) {
+                config.telegram_bot_token = v.to_string();
+            }
+            if let Some(v) = local.get("telegram_chat_id").and_then(|x| x.as_str()) {
+                config.telegram_chat_id = v.to_string();
+            }
+            if let Some(v) = local.get("telegram_login_password").and_then(|x| x.as_str()) {
+                config.telegram_login_password = v.to_string();
+            }
+        }
+    }
+
+    if config.telegram_bot_token.is_empty() {
+        config.telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    }
+    if config.telegram_chat_id.is_empty() {
+        config.telegram_chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+    }
+    if config.telegram_login_password.is_empty() {
+        config.telegram_login_password = std::env::var("TELEGRAM_LOGIN_PASSWORD").unwrap_or_default();
+    }
+
     anyhow::ensure!(!config.symbols.is_empty(), "config.symbols must not be empty");
     Ok(config)
 }
@@ -1070,3 +1127,146 @@ refresh();
 
 
 
+
+
+
+
+fn load_telegram_subscribers(path: &str) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_telegram_subscribers(path: &str, subscribers: &[String]) -> Result<()> {
+    let text = serde_json::to_string_pretty(subscribers)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Result<()> {
+    if config.telegram_bot_token.is_empty() || chat_id.is_empty() {
+        return Ok(());
+    }
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_bot_token);
+    let client = reqwest::Client::new();
+    client
+        .post(url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn send_telegram_report(config: &Config, snapshot: &DashboardSnapshot) -> Result<()> {
+    if config.telegram_bot_token.is_empty() {
+        return Ok(());
+    }
+    let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+    if subscribers.is_empty() {
+        return Ok(());
+    }
+
+    let mut text = String::new();
+    text.push_str("Отчет MEXC Lag Monitor\n");
+    text.push_str(&format!("Обновлено: {}\n", snapshot.updated_at));
+    text.push_str(&format!("{}\n", snapshot.summary));
+    text.push_str(&format!(
+        "Порог: impulse {} bps, confirm {} bps, max lag {} ms\n\n",
+        snapshot.impulse_bps, snapshot.confirm_bps, snapshot.max_lag_ms
+    ));
+
+    for row in &snapshot.symbols {
+        text.push_str(&format!(
+            "{}: events={}, avg={}ms, p95={}ms, gross={}bps, net fee={}bps, net 0 fee={}bps, pnl fee={} USDT, pnl 0 fee={} USDT\n",
+            row.symbol,
+            row.matched,
+            row.avg_lag_ms.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string()),
+            row.p95_lag_ms.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string()),
+            row.gross_bps.clone().unwrap_or_else(|| "-".to_string()),
+            row.net_fee_bps.clone().unwrap_or_else(|| "-".to_string()),
+            row.net_zero_fee_bps.clone().unwrap_or_else(|| "-".to_string()),
+            row.pnl_fee_usdt.clone().unwrap_or_else(|| "-".to_string()),
+            row.pnl_zero_fee_usdt.clone().unwrap_or_else(|| "-".to_string()),
+        ));
+    }
+
+    for chat_id in subscribers {
+        let _ = telegram_send_message(config, &chat_id, &text).await;
+    }
+    Ok(())
+}
+
+async fn run_telegram_login_bot(config: Config) {
+    if config.telegram_bot_token.is_empty() || config.telegram_login_password.is_empty() {
+        return;
+    }
+
+    let client = reqwest::Client::new();
+    let mut offset: i64 = 0;
+    loop {
+        let url = format!("https://api.telegram.org/bot{}/getUpdates", config.telegram_bot_token);
+        let response = client
+            .get(&url)
+            .query(&[("timeout", "20"), ("offset", &offset.to_string())])
+            .send()
+            .await;
+
+        if let Ok(resp) = response {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(updates) = json.get("result").and_then(|x| x.as_array()) {
+                    for update in updates {
+                        if let Some(update_id) = update.get("update_id").and_then(|x| x.as_i64()) {
+                            offset = update_id + 1;
+                        }
+                        let Some(message) = update.get("message") else { continue; };
+                        let Some(text) = message.get("text").and_then(|x| x.as_str()) else { continue; };
+                        let Some(chat_id) = message
+                            .get("chat")
+                            .and_then(|x| x.get("id"))
+                            .and_then(|x| x.as_i64())
+                            .map(|x| x.to_string()) else { continue; };
+
+                        if text.trim() == "/logout" {
+                            let mut subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+                            subscribers.retain(|x| x != &chat_id);
+                            let _ = save_telegram_subscribers(&config.telegram_subscribers_path, &subscribers);
+                            let _ = telegram_send_message(&config, &chat_id, "Вы вышли из рассылки отчетов.").await;
+                            continue;
+                        }
+
+                        if text.trim() == "/status" {
+                            let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+                            let msg = if subscribers.contains(&chat_id) {
+                                "Вы залогинены и будете получать отчеты."
+                            } else {
+                                "Вы не залогинены. Используйте /login password."
+                            };
+                            let _ = telegram_send_message(&config, &chat_id, msg).await;
+                            continue;
+                        }
+
+                        if let Some(password) = text.trim().strip_prefix("/login ") {
+                            if password.trim() == config.telegram_login_password {
+                                let mut subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+                                if !subscribers.contains(&chat_id) {
+                                    subscribers.push(chat_id.clone());
+                                    let _ = save_telegram_subscribers(&config.telegram_subscribers_path, &subscribers);
+                                }
+                                let _ = telegram_send_message(&config, &chat_id, "Логин успешен. Вы будете получать отчеты каждые 5 часов.").await;
+                            } else {
+                                let _ = telegram_send_message(&config, &chat_id, "Неверный пароль.").await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
