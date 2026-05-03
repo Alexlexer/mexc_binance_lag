@@ -63,6 +63,8 @@ struct Config {
     slippage_csv_path: String,
     #[serde(default = "default_mexc_taker_fee_bps")]
     mexc_taker_fee_bps: Decimal,
+    #[serde(default = "default_trade_notional_usdt")]
+    trade_notional_usdt: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +293,10 @@ fn default_mexc_taker_fee_bps() -> Decimal {
     Decimal::from(6)
 }
 
+fn default_trade_notional_usdt() -> Decimal {
+    Decimal::from(300)
+}
+
 fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string("config.json").context("read config.json")?;
     let config: Config = serde_json::from_str(&text).context("parse config.json")?;
@@ -316,7 +322,7 @@ fn open_slippage_csv(path: &str) -> Result<File> {
     if !exists {
         writeln!(
             file,
-            "utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,entry_spread_bps,exit_spread_bps,gross_cross_bps,fees_bps,net_cross_bps,binance_move_bps,mexc_move_bps"
+            "utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,entry_spread_bps,exit_spread_bps,gross_cross_bps,fees_bps,net_cross_bps,estimated_pnl_usdt,binance_move_bps,mexc_move_bps"
         )?;
     }
     Ok(file)
@@ -611,10 +617,11 @@ fn write_slippage_record(
 
     let fees_bps = config.mexc_taker_fee_bps * Decimal::from(2);
     let net_cross_bps = gross_cross_bps - fees_bps;
+    let estimated_pnl_usdt = config.trade_notional_usdt * net_cross_bps / Decimal::from(10_000);
 
     writeln!(
         file,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         Utc::now().to_rfc3339(),
         r.symbol,
         if r.direction > 0 { "up" } else { "down" },
@@ -628,6 +635,7 @@ fn write_slippage_record(
         gross_cross_bps,
         fees_bps,
         net_cross_bps,
+        estimated_pnl_usdt,
         r.binance_move_bps,
         r.mexc_move_bps
     )?;
@@ -1009,5 +1017,6 @@ refresh();
 </script>
 </body>
 </html>"#;
+
 
 
