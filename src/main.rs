@@ -606,11 +606,22 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, state: &mut Symbo
 
 async fn send_telegram_to_subscribers(config: &Config, text: &str) {
     if config.telegram_bot_token.is_empty() {
+        eprintln!("[telegram] skip send: bot token is empty");
         return;
     }
     let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+    if subscribers.is_empty() {
+        eprintln!(
+            "[telegram] skip send: no subscribers in {}",
+            config.telegram_subscribers_path
+        );
+        return;
+    }
+    eprintln!("[telegram] sending alert to {} subscriber(s)", subscribers.len());
     for chat_id in subscribers {
-        let _ = telegram_send_message(config, &chat_id, text).await;
+        if let Err(e) = telegram_send_message(config, &chat_id, text).await {
+            eprintln!("[telegram] send to {} failed: {:#}", chat_id, e);
+        }
     }
 }
 fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
@@ -1236,7 +1247,7 @@ async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Re
     }
     let url = format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_bot_token);
     let client = reqwest::Client::new();
-    client
+    let resp = client
         .post(url)
         .json(&serde_json::json!({
             "chat_id": chat_id,
@@ -1244,8 +1255,13 @@ async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Re
             "disable_web_page_preview": true
         }))
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .context("telegram sendMessage request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("telegram sendMessage HTTP {}: {}", status, body);
+    }
     Ok(())
 }
 
