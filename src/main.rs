@@ -938,7 +938,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>MEXC Lag Monitor</title>
+  <title>Монитор задержки MEXC</title>
   <style>
     :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background:#0f1115; color:#e7eaf0; }
     body { margin:0; background:#0f1115; }
@@ -962,23 +962,23 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 </head>
 <body>
 <header>
-  <h1>MEXC Lag Monitor</h1>
+  <h1>Монитор задержки Binance -> MEXC</h1>
   <div class="meta">
-    <span id="updated">waiting for data</span>
+    <span id="updated">ожидание данных</span>
     <span id="thresholds"></span>
-    <span>CSV: lag_events.csv / slippage_events.csv / stats_snapshots.csv</span>
+    <span>Файлы: lag_events.csv / slippage_events.csv / stats_snapshots.csv</span>
   </div>
 </header>
 <main>
   <section class="summary">
-    <div class="box">Binance quotes<b id="binanceQuotes">0</b></div>
-    <div class="box">MEXC quotes<b id="mexcQuotes">0</b></div>
-    <div class="box">Matched lag events<b id="matched">0</b></div>
-    <div class="box">Average lag<b id="avgLag">-</b></div>
+    <div class="box">Тики Binance<b id="binanceQuotes">0</b></div>
+    <div class="box">Тики MEXC<b id="mexcQuotes">0</b></div>
+    <div class="box">Подтвержденные события<b id="matched">0</b></div>
+    <div class="box">Средняя задержка<b id="avgLag">-</b></div>
   </section>
   <table>
     <thead><tr>
-      <th>Symbol</th><th>Binance q</th><th>MEXC q</th><th>Imp</th><th>Match</th><th>Exp</th><th>Avg</th><th>P50</th><th>P95</th><th>Binance mid</th><th>MEXC mid</th><th>Pending</th>
+      <th>Пара</th><th>Тики Binance</th><th>Тики MEXC</th><th>Имп.</th><th>Совп.</th><th>Истек.</th><th>Средн.</th><th>P50</th><th>P95</th><th>Mid Binance</th><th>Mid MEXC</th><th>Ожидание</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -990,8 +990,8 @@ async function refresh() {
   const res = await fetch('/api/state', { cache: 'no-store' });
   const data = await res.json();
   const rows = data.symbols || [];
-  document.getElementById('updated').textContent = `Updated ${data.updated_at || '-'}`;
-  document.getElementById('thresholds').textContent = `impulse ${data.impulse_bps}bps | confirm ${data.confirm_bps}bps | max lag ${data.max_lag_ms}ms`;
+  document.getElementById('updated').textContent = `Обновлено: ${data.updated_at || '-'}`;
+  document.getElementById('thresholds').textContent = `импульс ${data.impulse_bps} bps | подтверждение ${data.confirm_bps} bps | макс. задержка ${data.max_lag_ms} мс`;
   document.getElementById('binanceQuotes').textContent = sum(rows, 'binance_quotes');
   document.getElementById('mexcQuotes').textContent = sum(rows, 'mexc_quotes');
   document.getElementById('matched').textContent = sum(rows, 'matched');
@@ -1000,8 +1000,8 @@ async function refresh() {
   document.getElementById('rows').innerHTML = rows.map(r => `
     <tr class="${r.matched ? 'hot' : ''} ${r.pending ? 'pending' : ''}">
       <td>${r.symbol}</td><td>${r.binance_quotes}</td><td>${r.mexc_quotes}</td><td>${r.impulses}</td><td>${r.matched}</td><td>${r.expired}</td>
-      <td>${fmt(r.avg_lag_ms, ' ms')}</td><td>${fmt(r.p50_lag_ms, ' ms')}</td><td>${fmt(r.p95_lag_ms, ' ms')}</td>
-      <td>${fmt(r.binance_mid)}</td><td>${fmt(r.mexc_mid)}</td><td>${fmt(r.pending)}</td>
+      <td>${fmt(r.avg_lag_ms, ' мс')}</td><td>${fmt(r.p50_lag_ms, ' мс')}</td><td>${fmt(r.p95_lag_ms, ' мс')}</td>
+      <td>${fmt(r.binance_mid)}</td><td>${fmt(r.mexc_mid)}</td><td>${fmt(r.pending === 'UP' ? 'ВВЕРХ' : (r.pending === 'DOWN' ? 'ВНИЗ' : r.pending))}</td>
     </tr>`).join('');
 }
 setInterval(refresh, 1000);
@@ -1009,4 +1009,5 @@ refresh();
 </script>
 </body>
 </html>"#;
+
 
