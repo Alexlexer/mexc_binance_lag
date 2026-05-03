@@ -44,6 +44,13 @@ struct DashboardSymbolRow {
     binance_mid: Option<String>,
     mexc_mid: Option<String>,
     pending: Option<String>,
+    last_direction: Option<String>,
+    last_lag_ms: Option<i64>,
+    gross_bps: Option<String>,
+    net_fee_bps: Option<String>,
+    net_zero_fee_bps: Option<String>,
+    pnl_fee_usdt: Option<String>,
+    pnl_zero_fee_usdt: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
@@ -125,6 +132,17 @@ struct SymbolState {
 }
 
 #[derive(Default, Clone)]
+struct LastTradeEstimate {
+    direction: String,
+    lag_ms: i64,
+    gross_cross_bps: Decimal,
+    net_fee_bps: Decimal,
+    net_zero_fee_bps: Decimal,
+    pnl_fee_usdt: Decimal,
+    pnl_zero_fee_usdt: Decimal,
+}
+
+#[derive(Default, Clone)]
 struct SymbolStats {
     binance_quotes: u64,
     mexc_quotes: u64,
@@ -132,9 +150,14 @@ struct SymbolStats {
     matched: u64,
     expired: u64,
     lags_ms: Vec<i64>,
+    last_trade: Option<LastTradeEstimate>,
 }
 
 impl SymbolStats {
+    fn set_trade_estimate(&mut self, estimate: LastTradeEstimate) {
+        self.last_trade = Some(estimate);
+    }
+
     fn add_lag(&mut self, lag_ms: i64) {
         self.matched += 1;
         self.lags_ms.push(lag_ms);
@@ -192,6 +215,10 @@ impl Stats {
     fn record_expired(&mut self, symbol: &str) {
         self.expired += 1;
         self.symbol_mut(symbol).expired += 1;
+    }
+
+    fn set_trade_estimate(&mut self, symbol: &str, estimate: LastTradeEstimate) {
+        self.symbol_mut(symbol).set_trade_estimate(estimate);
     }
 
     fn add_lag(&mut self, symbol: &str, lag_ms: i64) {
@@ -439,7 +466,8 @@ fn handle_quote(
                 mexc_recv_ts_ms: update.recv_ts_ms,
             };
             write_record(csv, &record)?;
-            write_slippage_record(slippage_csv, config, &record, &pending, &update)?;
+            let estimate = write_slippage_record(slippage_csv, config, &record, &pending, &update)?;
+            stats.set_trade_estimate(&record.symbol, estimate);
             stats.add_lag(&record.symbol, record.lag_ms);
             state.pending = None;
 
@@ -595,7 +623,7 @@ fn write_slippage_record(
     r: &LagRecord,
     pending: &PendingEvent,
     mexc_confirm: &QuoteUpdate,
-) -> Result<()> {
+) -> Result<LastTradeEstimate> {
     let entry_bid = pending.mexc_start_bid;
     let entry_ask = pending.mexc_start_ask;
     let exit_bid = mexc_confirm.bid;
@@ -618,6 +646,7 @@ fn write_slippage_record(
     let fees_bps = config.mexc_taker_fee_bps * Decimal::from(2);
     let net_cross_bps = gross_cross_bps - fees_bps;
     let estimated_pnl_usdt = config.trade_notional_usdt * net_cross_bps / Decimal::from(10_000);
+    let pnl_zero_fee_usdt = config.trade_notional_usdt * gross_cross_bps / Decimal::from(10_000);
 
     writeln!(
         file,
@@ -641,7 +670,15 @@ fn write_slippage_record(
     )?;
     file.flush()?;
 
-    Ok(())
+    Ok(LastTradeEstimate {
+        direction: if r.direction > 0 { "UP".to_string() } else { "DOWN".to_string() },
+        lag_ms: r.lag_ms,
+        gross_cross_bps,
+        net_fee_bps: net_cross_bps,
+        net_zero_fee_bps: gross_cross_bps,
+        pnl_fee_usdt: estimated_pnl_usdt,
+        pnl_zero_fee_usdt,
+    })
 }
 fn write_record(csv: &mut File, r: &LagRecord) -> Result<()> {
     writeln!(
@@ -869,6 +906,7 @@ fn build_dashboard_snapshot(
             let symbol_stats = stats.by_symbol.get(symbol).cloned().unwrap_or_default();
             let lag = symbol_stats.lag_summary();
             let state = states.get(symbol);
+            let last_trade = symbol_stats.last_trade.clone();
             DashboardSymbolRow {
                 symbol: symbol.clone(),
                 binance_quotes: symbol_stats.binance_quotes,
@@ -888,6 +926,13 @@ fn build_dashboard_snapshot(
                 pending: state
                     .and_then(|s| s.pending.as_ref())
                     .map(|p| if p.direction > 0 { "UP".to_string() } else { "DOWN".to_string() }),
+                last_direction: last_trade.as_ref().map(|x| x.direction.clone()),
+                last_lag_ms: last_trade.as_ref().map(|x| x.lag_ms),
+                gross_bps: last_trade.as_ref().map(|x| x.gross_cross_bps.round_dp(3).to_string()),
+                net_fee_bps: last_trade.as_ref().map(|x| x.net_fee_bps.round_dp(3).to_string()),
+                net_zero_fee_bps: last_trade.as_ref().map(|x| x.net_zero_fee_bps.round_dp(3).to_string()),
+                pnl_fee_usdt: last_trade.as_ref().map(|x| x.pnl_fee_usdt.round_dp(4).to_string()),
+                pnl_zero_fee_usdt: last_trade.as_ref().map(|x| x.pnl_zero_fee_usdt.round_dp(4).to_string()),
             }
         })
         .collect();
@@ -986,7 +1031,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   </section>
   <table>
     <thead><tr>
-      <th>Пара</th><th>Тики Binance</th><th>Тики MEXC</th><th>Имп.</th><th>Совп.</th><th>Истек.</th><th>Средн.</th><th>P50</th><th>P95</th><th>Mid Binance</th><th>Mid MEXC</th><th>Ожидание</th>
+      <th>Пара</th><th>Тики Binance</th><th>Тики MEXC</th><th>Имп.</th><th>Совп.</th><th>Средн.</th><th>P95</th><th>Gross bps</th><th>Net fee</th><th>Net 0 fee</th><th>PnL fee</th><th>PnL 0 fee</th><th>Ожидание</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -1007,9 +1052,11 @@ async function refresh() {
   document.getElementById('avgLag').textContent = lags.length ? `${Math.round(lags.reduce((a,b)=>a+b,0)/lags.length)} ms` : '-';
   document.getElementById('rows').innerHTML = rows.map(r => `
     <tr class="${r.matched ? 'hot' : ''} ${r.pending ? 'pending' : ''}">
-      <td>${r.symbol}</td><td>${r.binance_quotes}</td><td>${r.mexc_quotes}</td><td>${r.impulses}</td><td>${r.matched}</td><td>${r.expired}</td>
-      <td>${fmt(r.avg_lag_ms, ' мс')}</td><td>${fmt(r.p50_lag_ms, ' мс')}</td><td>${fmt(r.p95_lag_ms, ' мс')}</td>
-      <td>${fmt(r.binance_mid)}</td><td>${fmt(r.mexc_mid)}</td><td>${fmt(r.pending === 'UP' ? 'ВВЕРХ' : (r.pending === 'DOWN' ? 'ВНИЗ' : r.pending))}</td>
+      <td>${r.symbol}</td><td>${r.binance_quotes}</td><td>${r.mexc_quotes}</td><td>${r.impulses}</td><td>${r.matched}</td>
+      <td>${fmt(r.avg_lag_ms, ' мс')}</td><td>${fmt(r.p95_lag_ms, ' мс')}</td>
+      <td>${fmt(r.gross_bps)}</td><td>${fmt(r.net_fee_bps)}</td><td>${fmt(r.net_zero_fee_bps)}</td>
+      <td>${fmt(r.pnl_fee_usdt, ' USDT')}</td><td>${fmt(r.pnl_zero_fee_usdt, ' USDT')}</td>
+      <td>${fmt(r.pending === 'UP' ? 'ВВЕРХ' : (r.pending === 'DOWN' ? 'ВНИЗ' : r.pending))}</td>
     </tr>`).join('');
 }
 setInterval(refresh, 1000);
@@ -1017,6 +1064,9 @@ refresh();
 </script>
 </body>
 </html>"#;
+
+
+
 
 
 
