@@ -1,17 +1,50 @@
 use anyhow::{Context, Result};
+use axum::{extract::State, response::Html, routing::get, Json, Router};
+use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
+use tower_http::cors::CorsLayer;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info};
 
+
+
+type SharedDashboard = Arc<RwLock<DashboardSnapshot>>;
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DashboardSnapshot {
+    updated_at: String,
+    summary: String,
+    impulse_bps: String,
+    confirm_bps: String,
+    max_lag_ms: i64,
+    symbols: Vec<DashboardSymbolRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DashboardSymbolRow {
+    symbol: String,
+    binance_quotes: u64,
+    mexc_quotes: u64,
+    impulses: u64,
+    matched: u64,
+    expired: u64,
+    avg_lag_ms: Option<i64>,
+    p50_lag_ms: Option<i64>,
+    p95_lag_ms: Option<i64>,
+    binance_mid: Option<String>,
+    mexc_mid: Option<String>,
+    pending: Option<String>,
+}
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     symbols: Vec<String>,
@@ -201,11 +234,14 @@ impl Stats {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("warn".parse()?))
         .init();
 
     let config = load_config()?;
-    info!("starting MEXC lag monitor for symbols: {}", config.symbols.join(", "));
+    let dashboard = Arc::new(RwLock::new(DashboardSnapshot::default()));
+    tokio::spawn(run_dashboard(dashboard.clone()));
+    open_dashboard_in_browser();
 
     let (tx, mut rx) = mpsc::channel::<QuoteUpdate>(20_000);
     tokio::spawn(run_binance(config.clone(), tx.clone()));
@@ -221,14 +257,21 @@ async fn main() -> Result<()> {
         .collect();
     let mut stats = Stats::default();
     let mut stats_tick = tokio::time::interval(Duration::from_secs(config.stats_interval_secs));
+    let mut dashboard_tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
             Some(update) = rx.recv() => {
                 handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv)?;
             }
+            _ = dashboard_tick.tick() => {
+                let snapshot = build_dashboard_snapshot(&config, &states, &stats);
+                *dashboard.write().await = snapshot;
+            }
             _ = stats_tick.tick() => {
                 expire_old_pending(&config, &mut states, &mut stats);
+                let snapshot = build_dashboard_snapshot(&config, &states, &stats);
+                *dashboard.write().await = snapshot;
                 print_stats(&config, &states, &stats);
                 write_stats_snapshot(&mut stats_csv, &config, &states, &stats)?;
             }
@@ -414,8 +457,8 @@ fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>
 }
 
 fn print_stats(config: &Config, states: &HashMap<String, SymbolState>, stats: &Stats) {
-    print!("\x1B[2J\x1B[H");
-    let _ = io::stdout().flush();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
     println!("=== MEXC LAG MONITOR {} | symbols={} ===", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"), config.symbols.len());
     println!("{}", stats.summary());
     println!(
@@ -614,33 +657,28 @@ fn write_record(csv: &mut File, r: &LagRecord) -> Result<()> {
 }
 
 async fn run_binance(config: Config, tx: mpsc::Sender<QuoteUpdate>) {
-    let streams = config
-        .symbols
-        .iter()
-        .map(|s| format!("{}@bookTicker", s.replace('_', "").to_lowercase()))
-        .collect::<Vec<_>>()
-        .join("/");
-    let url = format!("{}?streams={}", config.binance_ws, streams);
+    let symbols: HashSet<String> = config.symbols.iter().cloned().collect();
+    let url = format!("{}?streams=!bookTicker", config.binance_ws);
 
     loop {
-        if let Err(e) = binance_session(&url, &tx).await {
-            error!("Binance session error: {e:#}");
-        }
+        let _ = binance_session(&url, &symbols, &tx).await;
         sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn binance_session(url: &str, tx: &mpsc::Sender<QuoteUpdate>) -> Result<()> {
-    info!("connecting Binance {url}");
+async fn binance_session(
+    url: &str,
+    symbols: &HashSet<String>,
+    tx: &mpsc::Sender<QuoteUpdate>,
+) -> Result<()> {
     let (ws, _) = connect_async(url).await?;
-    info!("connected Binance");
     let (_, mut read) = ws.split();
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
         if let Message::Text(text) = msg {
-            if let Some(update) = parse_binance_book_ticker(&text) {
-                if tx.send(update).await.is_err() {
+            for update in parse_binance_book_tickers(&text) {
+                if symbols.contains(&update.symbol) && tx.send(update).await.is_err() {
                     break;
                 }
             }
@@ -651,17 +689,13 @@ async fn binance_session(url: &str, tx: &mpsc::Sender<QuoteUpdate>) -> Result<()
 
 async fn run_mexc(config: Config, tx: mpsc::Sender<QuoteUpdate>) {
     loop {
-        if let Err(e) = mexc_session(&config, &tx).await {
-            error!("MEXC session error: {e:#}");
-        }
+        let _ = mexc_session(&config, &tx).await;
         sleep(Duration::from_secs(2)).await;
     }
 }
 
 async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result<()> {
-    info!("connecting MEXC {}", config.mexc_ws);
     let (ws, _) = connect_async(config.mexc_ws.as_str()).await?;
-    info!("connected MEXC");
     let (mut write, mut read) = ws.split();
 
     for symbol in &config.symbols {
@@ -698,7 +732,7 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
 
 #[derive(Debug, Deserialize)]
 struct BinanceCombined {
-    data: BinanceBookTicker,
+    data: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -711,16 +745,30 @@ struct BinanceBookTicker {
     ask: String,
 }
 
-fn parse_binance_book_ticker(text: &str) -> Option<QuoteUpdate> {
-    let wrapper: BinanceCombined = serde_json::from_str(text).ok()?;
-    let bid = Decimal::from_str(&wrapper.data.bid).ok()?;
-    let ask = Decimal::from_str(&wrapper.data.ask).ok()?;
+fn parse_binance_book_tickers(text: &str) -> Vec<QuoteUpdate> {
+    let Ok(wrapper) = serde_json::from_str::<BinanceCombined>(text) else {
+        return Vec::new();
+    };
+
+    match wrapper.data {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(parse_binance_book_ticker_value)
+            .collect(),
+        value => parse_binance_book_ticker_value(value).into_iter().collect(),
+    }
+}
+
+fn parse_binance_book_ticker_value(value: serde_json::Value) -> Option<QuoteUpdate> {
+    let data: BinanceBookTicker = serde_json::from_value(value).ok()?;
+    let bid = Decimal::from_str(&data.bid).ok()?;
+    let ask = Decimal::from_str(&data.ask).ok()?;
     if bid <= Decimal::ZERO || ask <= Decimal::ZERO || bid >= ask {
         return None;
     }
     Some(QuoteUpdate {
         exchange: Exchange::Binance,
-        symbol: normalize_binance_symbol(&wrapper.data.symbol),
+        symbol: normalize_binance_symbol(&data.symbol),
         bid,
         ask,
         recv_ts_ms: now_ms(),
@@ -796,4 +844,169 @@ fn now_ms() -> i64 {
 
 
 
+
+
+
+
+
+fn build_dashboard_snapshot(
+    config: &Config,
+    states: &HashMap<String, SymbolState>,
+    stats: &Stats,
+) -> DashboardSnapshot {
+    let symbols = config
+        .symbols
+        .iter()
+        .map(|symbol| {
+            let symbol_stats = stats.by_symbol.get(symbol).cloned().unwrap_or_default();
+            let lag = symbol_stats.lag_summary();
+            let state = states.get(symbol);
+            DashboardSymbolRow {
+                symbol: symbol.clone(),
+                binance_quotes: symbol_stats.binance_quotes,
+                mexc_quotes: symbol_stats.mexc_quotes,
+                impulses: symbol_stats.impulses,
+                matched: symbol_stats.matched,
+                expired: symbol_stats.expired,
+                avg_lag_ms: lag.map(|x| x.0.round() as i64),
+                p50_lag_ms: lag.map(|x| x.1),
+                p95_lag_ms: lag.map(|x| x.2),
+                binance_mid: state
+                    .and_then(|s| s.last_binance.as_ref())
+                    .map(|q| q.mid().round_dp(6).to_string()),
+                mexc_mid: state
+                    .and_then(|s| s.last_mexc.as_ref())
+                    .map(|q| q.mid().round_dp(6).to_string()),
+                pending: state
+                    .and_then(|s| s.pending.as_ref())
+                    .map(|p| if p.direction > 0 { "UP".to_string() } else { "DOWN".to_string() }),
+            }
+        })
+        .collect();
+
+    DashboardSnapshot {
+        updated_at: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        summary: stats.summary(),
+        impulse_bps: config.impulse_bps.to_string(),
+        confirm_bps: config.confirm_bps.to_string(),
+        max_lag_ms: config.max_lag_ms,
+        symbols,
+    }
+}
+
+async fn run_dashboard(state: SharedDashboard) {
+    let app = Router::new()
+        .route("/", get(dashboard_html))
+        .route("/api/state", get(dashboard_state))
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
+        return;
+    };
+    let _ = axum::serve(listener, app).await;
+}
+
+async fn dashboard_state(State(state): State<SharedDashboard>) -> Json<DashboardSnapshot> {
+    Json(state.read().await.clone())
+}
+
+async fn dashboard_html() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
+}
+
+fn open_dashboard_in_browser() {
+    tokio::spawn(async {
+        sleep(Duration::from_millis(800)).await;
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", "http://127.0.0.1:8787"])
+            .spawn();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open")
+            .arg("http://127.0.0.1:8787")
+            .spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let _ = std::process::Command::new("xdg-open")
+            .arg("http://127.0.0.1:8787")
+            .spawn();
+    });
+}
+
+const DASHBOARD_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MEXC Lag Monitor</title>
+  <style>
+    :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background:#0f1115; color:#e7eaf0; }
+    body { margin:0; background:#0f1115; }
+    header { position:sticky; top:0; background:#151923; border-bottom:1px solid #2a3040; padding:14px 18px; z-index:2; }
+    h1 { margin:0 0 8px; font-size:20px; font-weight:650; }
+    .meta { display:flex; flex-wrap:wrap; gap:10px 18px; color:#aab3c5; font-size:13px; }
+    main { padding:16px 18px 28px; }
+    .summary { display:grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap:10px; margin-bottom:14px; }
+    .box { background:#171c27; border:1px solid #2a3040; border-radius:6px; padding:10px 12px; }
+    .box b { display:block; font-size:18px; margin-top:4px; color:#fff; }
+    table { width:100%; border-collapse:collapse; font-size:13px; background:#121722; border:1px solid #2a3040; }
+    th, td { padding:7px 8px; border-bottom:1px solid #242b3a; text-align:right; white-space:nowrap; }
+    th:first-child, td:first-child { text-align:left; position:sticky; left:0; background:#121722; }
+    th { color:#9eabc0; background:#171c27; position:sticky; top:79px; z-index:1; }
+    tr.hot td { background:#18251d; }
+    tr.pending td { background:#242016; }
+    a { color:#8fb7ff; text-decoration:none; }
+    .links { margin-top:12px; display:flex; gap:14px; color:#aab3c5; font-size:13px; }
+    .muted { color:#7d8799; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>MEXC Lag Monitor</h1>
+  <div class="meta">
+    <span id="updated">waiting for data</span>
+    <span id="thresholds"></span>
+    <span>CSV: lag_events.csv / slippage_events.csv / stats_snapshots.csv</span>
+  </div>
+</header>
+<main>
+  <section class="summary">
+    <div class="box">Binance quotes<b id="binanceQuotes">0</b></div>
+    <div class="box">MEXC quotes<b id="mexcQuotes">0</b></div>
+    <div class="box">Matched lag events<b id="matched">0</b></div>
+    <div class="box">Average lag<b id="avgLag">-</b></div>
+  </section>
+  <table>
+    <thead><tr>
+      <th>Symbol</th><th>Binance q</th><th>MEXC q</th><th>Imp</th><th>Match</th><th>Exp</th><th>Avg</th><th>P50</th><th>P95</th><th>Binance mid</th><th>MEXC mid</th><th>Pending</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+function fmt(v, suffix='') { return v === null || v === undefined ? '-' : `${v}${suffix}`; }
+function sum(rows, key) { return rows.reduce((a, r) => a + (r[key] || 0), 0); }
+async function refresh() {
+  const res = await fetch('/api/state', { cache: 'no-store' });
+  const data = await res.json();
+  const rows = data.symbols || [];
+  document.getElementById('updated').textContent = `Updated ${data.updated_at || '-'}`;
+  document.getElementById('thresholds').textContent = `impulse ${data.impulse_bps}bps | confirm ${data.confirm_bps}bps | max lag ${data.max_lag_ms}ms`;
+  document.getElementById('binanceQuotes').textContent = sum(rows, 'binance_quotes');
+  document.getElementById('mexcQuotes').textContent = sum(rows, 'mexc_quotes');
+  document.getElementById('matched').textContent = sum(rows, 'matched');
+  const lags = rows.map(r => r.avg_lag_ms).filter(v => v !== null && v !== undefined);
+  document.getElementById('avgLag').textContent = lags.length ? `${Math.round(lags.reduce((a,b)=>a+b,0)/lags.length)} ms` : '-';
+  document.getElementById('rows').innerHTML = rows.map(r => `
+    <tr class="${r.matched ? 'hot' : ''} ${r.pending ? 'pending' : ''}">
+      <td>${r.symbol}</td><td>${r.binance_quotes}</td><td>${r.mexc_quotes}</td><td>${r.impulses}</td><td>${r.matched}</td><td>${r.expired}</td>
+      <td>${fmt(r.avg_lag_ms, ' ms')}</td><td>${fmt(r.p50_lag_ms, ' ms')}</td><td>${fmt(r.p95_lag_ms, ' ms')}</td>
+      <td>${fmt(r.binance_mid)}</td><td>${fmt(r.mexc_mid)}</td><td>${fmt(r.pending)}</td>
+    </tr>`).join('');
+}
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>"#;
 
