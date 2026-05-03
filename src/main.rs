@@ -43,6 +43,8 @@ struct DashboardSymbolRow {
     p95_lag_ms: Option<i64>,
     binance_mid: Option<String>,
     mexc_mid: Option<String>,
+    price_diff_usdt: Option<String>,
+    price_diff_bps: Option<String>,
     pending: Option<String>,
     last_direction: Option<String>,
     last_lag_ms: Option<i64>,
@@ -833,11 +835,6 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
 }
 
 #[derive(Debug, Deserialize)]
-struct BinanceCombined {
-    data: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
 struct BinanceBookTicker {
     #[serde(rename = "s")]
     symbol: String,
@@ -848,11 +845,12 @@ struct BinanceBookTicker {
 }
 
 fn parse_binance_book_tickers(text: &str) -> Vec<QuoteUpdate> {
-    let Ok(wrapper) = serde_json::from_str::<BinanceCombined>(text) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
     };
 
-    match wrapper.data {
+    let data = value.get("data").cloned().unwrap_or(value);
+    match data {
         serde_json::Value::Array(items) => items
             .into_iter()
             .filter_map(parse_binance_book_ticker_value)
@@ -963,6 +961,16 @@ fn build_dashboard_snapshot(
             let symbol_stats = stats.by_symbol.get(symbol).cloned().unwrap_or_default();
             let lag = symbol_stats.lag_summary();
             let state = states.get(symbol);
+            let b_mid_dec = state.and_then(|s| s.last_binance.as_ref()).map(|q| q.mid());
+            let m_mid_dec = state.and_then(|s| s.last_mexc.as_ref()).map(|q| q.mid());
+            let price_diff = match (b_mid_dec, m_mid_dec) {
+                (Some(b), Some(m)) => Some(m - b),
+                _ => None,
+            };
+            let price_diff_bps = match (b_mid_dec, price_diff) {
+                (Some(b), Some(d)) if b > Decimal::ZERO => Some(d / b * Decimal::from(10_000)),
+                _ => None,
+            };
             let last_trade = symbol_stats.last_trade.clone();
             DashboardSymbolRow {
                 symbol: symbol.clone(),
@@ -980,6 +988,8 @@ fn build_dashboard_snapshot(
                 mexc_mid: state
                     .and_then(|s| s.last_mexc.as_ref())
                     .map(|q| q.mid().round_dp(6).to_string()),
+                price_diff_usdt: price_diff.map(|x| x.round_dp(6).to_string()),
+                price_diff_bps: price_diff_bps.map(|x| x.round_dp(3).to_string()),
                 pending: state
                     .and_then(|s| s.pending.as_ref())
                     .map(|p| if p.direction > 0 { "UP".to_string() } else { "DOWN".to_string() }),
@@ -1088,7 +1098,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   </section>
   <table>
     <thead><tr>
-      <th>Пара</th><th>Тики Binance</th><th>Тики MEXC</th><th>Имп.</th><th>Совп.</th><th>Средн.</th><th>P95</th><th>Gross bps</th><th>Net fee</th><th>Net 0 fee</th><th>PnL fee</th><th>PnL 0 fee</th><th>Ожидание</th>
+      <th>Пара</th><th>Цена Binance</th><th>Цена MEXC</th><th>Разница $</th><th>Разница bps</th><th>Имп.</th><th>Совп.</th><th>Средн.</th><th>P95</th><th>Net fee</th><th>Net 0 fee</th><th>PnL 0 fee</th><th>Ожидание</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -1109,10 +1119,9 @@ async function refresh() {
   document.getElementById('avgLag').textContent = lags.length ? `${Math.round(lags.reduce((a,b)=>a+b,0)/lags.length)} ms` : '-';
   document.getElementById('rows').innerHTML = rows.map(r => `
     <tr class="${r.matched ? 'hot' : ''} ${r.pending ? 'pending' : ''}">
-      <td>${r.symbol}</td><td>${r.binance_quotes}</td><td>${r.mexc_quotes}</td><td>${r.impulses}</td><td>${r.matched}</td>
-      <td>${fmt(r.avg_lag_ms, ' мс')}</td><td>${fmt(r.p95_lag_ms, ' мс')}</td>
-      <td>${fmt(r.gross_bps)}</td><td>${fmt(r.net_fee_bps)}</td><td>${fmt(r.net_zero_fee_bps)}</td>
-      <td>${fmt(r.pnl_fee_usdt, ' USDT')}</td><td>${fmt(r.pnl_zero_fee_usdt, ' USDT')}</td>
+      <td>${r.symbol}</td><td>${fmt(r.binance_mid)}</td><td>${fmt(r.mexc_mid)}</td><td>${fmt(r.price_diff_usdt)}</td><td>${fmt(r.price_diff_bps)}</td>
+      <td>${r.impulses}</td><td>${r.matched}</td><td>${fmt(r.avg_lag_ms, ' мс')}</td><td>${fmt(r.p95_lag_ms, ' мс')}</td>
+      <td>${fmt(r.net_fee_bps)}</td><td>${fmt(r.net_zero_fee_bps)}</td><td>${fmt(r.pnl_zero_fee_usdt, ' USDT')}</td>
       <td>${fmt(r.pending === 'UP' ? 'ВВЕРХ' : (r.pending === 'DOWN' ? 'ВНИЗ' : r.pending))}</td>
     </tr>`).join('');
 }
@@ -1270,3 +1279,6 @@ async fn run_telegram_login_bot(config: Config) {
         sleep(Duration::from_secs(2)).await;
     }
 }
+
+
+
