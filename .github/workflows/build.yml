@@ -17,18 +17,30 @@ jobs:
             os: ubuntu-latest
             artifact: mexc_lag-linux-x64
             bin: target/release/mexc_lag
+            exe: mexc_lag
+            archive: mexc_lag-linux-x64.tar.gz
+            unix: true
           - name: macos-arm64
             os: macos-14
             artifact: mexc_lag-macos-arm64
             bin: target/release/mexc_lag
+            exe: mexc_lag
+            archive: mexc_lag-macos-arm64.tar.gz
+            unix: true
           - name: macos-x64
             os: macos-13
             artifact: mexc_lag-macos-x64
             bin: target/release/mexc_lag
+            exe: mexc_lag
+            archive: mexc_lag-macos-x64.tar.gz
+            unix: true
           - name: windows-x64
             os: windows-latest
             artifact: mexc_lag-windows-x64
             bin: target/release/mexc_lag.exe
+            exe: mexc_lag.exe
+            archive: mexc_lag-windows-x64.zip
+            unix: false
 
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +50,29 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Prepare artifact
+      - name: Prepare Unix package
+        if: matrix.unix == true
         shell: bash
         run: |
-          mkdir -p dist
-          cp "${{ matrix.bin }}" "dist/"
-          cp config.json README.md "dist/"
+          set -euo pipefail
+          pkg="package/${{ matrix.artifact }}"
+          mkdir -p "$pkg"
+          cp "${{ matrix.bin }}" "$pkg/${{ matrix.exe }}"
+          cp config.json README.md run.sh "$pkg/"
+          chmod +x "$pkg/${{ matrix.exe }}" "$pkg/run.sh"
+          tar -C package -czf "${{ matrix.archive }}" "${{ matrix.artifact }}"
+
+      - name: Prepare Windows package
+        if: matrix.unix == false
+        shell: pwsh
+        run: |
+          $pkg = "package/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item "${{ matrix.bin }}" "$pkg/${{ matrix.exe }}"
+          Copy-Item config.json,README.md,run.cmd,run-visible.cmd $pkg
+          Compress-Archive -Path "$pkg/*" -DestinationPath "${{ matrix.archive }}" -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/*
+          path: ${{ matrix.archive }}
