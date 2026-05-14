@@ -1334,27 +1334,18 @@ fn write_record(csv: &mut File, r: &LagRecord) -> Result<()> {
 // ── WebSocket feeds ───────────────────────────────────────────────────────────
 
 async fn run_binance(config: Config, tx: mpsc::Sender<QuoteUpdate>) {
-    for symbol in config.symbols.clone() {
-        let tx = tx.clone();
-        let base_url = config.binance_ws.clone();
-        let idle_reconnect_ms = config.binance_idle_reconnect_ms;
-        tokio::spawn(async move {
-            let mut symbols = HashSet::new();
-            symbols.insert(symbol.clone());
-            let stream = format!("{}@bookTicker", binance_stream_symbol(&symbol));
-            let url = format!("{}?streams={}", base_url, stream);
-            loop {
-                eprintln!("[binance] connecting stream: {stream}");
-                if let Err(e) = binance_session(&url, &symbols, &tx, idle_reconnect_ms).await {
-                    eprintln!("[binance] session error {symbol}: {e:#}");
-                }
-                sleep(Duration::from_secs(2)).await;
-            }
-        });
-    }
+    let streams: Vec<String> = config.symbols.iter()
+        .map(|s| format!("{}@bookTicker", binance_stream_symbol(s)))
+        .collect();
+    let url = format!("{}?streams={}", config.binance_ws, streams.join("/"));
+    let symbols: HashSet<String> = config.symbols.iter().cloned().collect();
 
     loop {
-        sleep(Duration::from_secs(3600)).await;
+        eprintln!("[binance] connecting combined stream ({} symbols)", symbols.len());
+        if let Err(e) = binance_session(&url, &symbols, &tx).await {
+            eprintln!("[binance] session error: {e:#}");
+        }
+        sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -1369,34 +1360,17 @@ async fn binance_session(
     url: &str,
     symbols: &HashSet<String>,
     tx: &mpsc::Sender<QuoteUpdate>,
-    idle_reconnect_ms: u64,
 ) -> Result<()> {
     let (ws, _) = connect_async(url).await?;
     let (_, mut read) = ws.split();
-    let idle_reconnect = Duration::from_millis(idle_reconnect_ms);
-    let mut idle_tick = tokio::time::interval(idle_reconnect);
 
-    loop {
-        tokio::select! {
-            _ = idle_tick.tick() => {
-                eprintln!("[binance] idle reconnect after {idle_reconnect_ms}ms");
-                break;
-            }
-            msg = read.next() => {
-                let Some(msg) = msg else { break; };
-                let msg = msg?;
-                if let Message::Text(text) = msg {
-                    let mut sent_any = false;
-                    for update in parse_binance_book_tickers(&text) {
-                        if symbols.contains(&update.symbol) {
-                            sent_any = true;
-                            if tx.send(update).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    if sent_any {
-                        idle_tick.reset();
+    while let Some(msg) = read.next().await {
+        let msg = msg?;
+        if let Message::Text(text) = msg {
+            for update in parse_binance_book_tickers(&text) {
+                if symbols.contains(&update.symbol) {
+                    if tx.send(update).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
