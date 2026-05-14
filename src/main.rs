@@ -1393,7 +1393,6 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
             "param": { "symbol": symbol, "limit": 5 }
         });
         write.send(Message::Text(sub.to_string())).await?;
-        sleep(Duration::from_millis(80)).await;
     }
 
     let mut ping_tick = tokio::time::interval(Duration::from_secs(15));
