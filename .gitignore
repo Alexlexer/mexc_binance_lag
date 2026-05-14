@@ -1,4 +1,5 @@
 /target
+users.json
 lag_events.csv
 stats_snapshots.csv
 slippage_events.csv

@@ -1,24 +1,105 @@
+mod mexc_trade;
+use mexc_trade::MexcTradeClient;
 use anyhow::{Context, Result};
-use axum::{extract::State, response::Html, routing::get, Json, Router};
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use axum::{
+    extract::{ConnectInfo, State},
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use rand::{distributions::Alphanumeric, Rng};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::str::FromStr;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 
 
+static TELEGRAM_BLOCKED_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct User {
+    username: String,
+    hash: String,
+}
+
+struct Session {
+    #[allow(dead_code)]
+    username: String,
+    expires_ms: i64,
+}
+
+#[derive(Default)]
+struct LoginAttempts {
+    records: HashMap<String, (u32, i64)>, // ip -> (fail_count, blocked_until_ms)
+}
+
+impl LoginAttempts {
+    fn is_blocked(&self, ip: &str) -> bool {
+        if let Some(&(count, blocked_until)) = self.records.get(ip) {
+            count >= 5 && now_ms() < blocked_until
+        } else {
+            false
+        }
+    }
+
+    fn record_failure(&mut self, ip: &str) {
+        let entry = self.records.entry(ip.to_string()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = now_ms() + 15 * 60 * 1_000;
+    }
+
+    fn record_success(&mut self, ip: &str) {
+        self.records.remove(ip);
+    }
+}
+
+type SharedSessions = Arc<RwLock<HashMap<String, Session>>>;
+type SharedLoginAttempts = Arc<Mutex<LoginAttempts>>;
+
+// ── Dashboard / app state ────────────────────────────────────────────────────
+
 type SharedDashboard = Arc<RwLock<DashboardSnapshot>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveConfig {
+    impulse_bps: Decimal,
+    confirm_bps: Decimal,
+    alert_diff_bps: Decimal,
+    trade_notional_usdt: Decimal,
+    trade_enabled: bool,
+}
+
+type SharedLiveConfig = Arc<RwLock<LiveConfig>>;
+
+#[derive(Clone)]
+struct AppState {
+    dashboard: SharedDashboard,
+    live_cfg: SharedLiveConfig,
+    sessions: SharedSessions,
+    users: Arc<Vec<User>>,
+    login_attempts: SharedLoginAttempts,
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct DashboardSnapshot {
@@ -54,6 +135,7 @@ struct DashboardSymbolRow {
     pnl_fee_usdt: Option<String>,
     pnl_zero_fee_usdt: Option<String>,
 }
+
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     symbols: Vec<String>,
@@ -84,6 +166,26 @@ struct Config {
     telegram_subscribers_path: String,
     #[serde(default = "default_alert_diff_bps")]
     alert_diff_bps: Decimal,
+    #[serde(default = "default_alert_min_edge_bps")]
+    alert_min_edge_bps: Decimal,
+    #[serde(default = "default_alert_min_duration_ms")]
+    alert_min_duration_ms: i64,
+    #[serde(default = "default_max_quote_age_ms")]
+    max_quote_age_ms: i64,
+    #[serde(default = "default_binance_idle_reconnect_ms")]
+    binance_idle_reconnect_ms: u64,
+    #[serde(default)]
+    mexc_api_key: String,
+    #[serde(default)]
+    mexc_api_secret: String,
+    #[serde(default)]
+    trade_enabled: bool,
+    #[serde(default = "default_trade_vol")]
+    trade_vol: String,
+    #[serde(default = "default_trade_leverage")]
+    trade_leverage: i32,
+    #[serde(default = "default_trade_timeout_ms")]
+    trade_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +245,18 @@ struct ActiveDiffAlert {
     start_diff_bps: Decimal,
     start_diff_usdt: Decimal,
     max_abs_diff_bps: Decimal,
+    start_edge_zero_fee_bps: Decimal,
+    max_edge_zero_fee_bps: Decimal,
+    notified: bool,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct DiffEdgeEstimate {
+    mexc_spread_bps: Decimal,
+    edge_zero_fee_bps: Decimal,
+    pnl_zero_fee_usdt: Decimal,
+}
+
 #[derive(Default)]
 struct SymbolState {
     last_binance: Option<QuoteUpdate>,
@@ -151,6 +264,8 @@ struct SymbolState {
     pending: Option<PendingEvent>,
     last_event_ts_ms: i64,
     active_diff_alert: Option<ActiveDiffAlert>,
+    active_trade_close: Option<tokio::sync::oneshot::Sender<()>>,
+    last_diff_alert_closed_ms: i64,
 }
 
 #[derive(Default, Clone)]
@@ -282,22 +397,57 @@ impl Stats {
     }
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--add-user") {
+        return add_user_interactive();
+    }
+
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("warn".parse()?))
         .init();
 
     let config = load_config()?;
+    let users = load_users();
+
+    let live_cfg: SharedLiveConfig = Arc::new(RwLock::new(LiveConfig {
+        impulse_bps: config.impulse_bps,
+        confirm_bps: config.confirm_bps,
+        alert_diff_bps: config.alert_diff_bps,
+        trade_notional_usdt: config.trade_notional_usdt,
+        trade_enabled: config.trade_enabled,
+    }));
     let dashboard = Arc::new(RwLock::new(DashboardSnapshot::default()));
-    tokio::spawn(run_dashboard(dashboard.clone()));
+    let sessions: SharedSessions = Arc::new(RwLock::new(HashMap::new()));
+    let login_attempts: SharedLoginAttempts = Arc::new(Mutex::new(LoginAttempts::default()));
+
+    let app_state = AppState {
+        dashboard: dashboard.clone(),
+        live_cfg: live_cfg.clone(),
+        sessions,
+        users: Arc::new(users),
+        login_attempts,
+    };
+
+    tokio::spawn(run_dashboard(app_state));
     tokio::spawn(run_telegram_login_bot(config.clone()));
     open_dashboard_in_browser();
 
     let (tx, mut rx) = mpsc::channel::<QuoteUpdate>(20_000);
     tokio::spawn(run_binance(config.clone(), tx.clone()));
     tokio::spawn(run_mexc(config.clone(), tx));
+
+    let trade_client: Option<Arc<MexcTradeClient>> = if config.trade_enabled && !config.mexc_api_key.is_empty() {
+        eprintln!("[trade] enabled, max 1 position");
+        Some(Arc::new(MexcTradeClient::new(config.mexc_api_key.clone(), config.mexc_api_secret.clone(), 1)))
+    } else {
+        eprintln!("[trade] disabled");
+        None
+    };
 
     let mut csv = open_csv(&config.csv_path)?;
     let mut stats_csv = open_stats_csv(&config.stats_csv_path)?;
@@ -314,15 +464,17 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             Some(update) = rx.recv() => {
-                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv).await?;
+                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv, trade_client.clone(), &live_cfg).await?;
             }
             _ = dashboard_tick.tick() => {
-                let snapshot = build_dashboard_snapshot(&config, &states, &stats);
+                let live = live_cfg.read().await.clone();
+                let snapshot = build_dashboard_snapshot(&config, &live, &states, &stats);
                 *dashboard.write().await = snapshot;
             }
             _ = stats_tick.tick() => {
+                let live = live_cfg.read().await.clone();
                 expire_old_pending(&config, &mut states, &mut stats);
-                let snapshot = build_dashboard_snapshot(&config, &states, &stats);
+                let snapshot = build_dashboard_snapshot(&config, &live, &states, &stats);
                 *dashboard.write().await = snapshot;
                 print_stats(&config, &states, &stats);
                 write_stats_snapshot(&mut stats_csv, &config, &states, &stats)?;
@@ -331,29 +483,21 @@ async fn main() -> Result<()> {
     }
 }
 
-fn default_stats_csv_path() -> String {
-    "stats_snapshots.csv".to_string()
-}
+// ── Config defaults ───────────────────────────────────────────────────────────
 
-fn default_slippage_csv_path() -> String {
-    "slippage_events.csv".to_string()
-}
-
-fn default_mexc_taker_fee_bps() -> Decimal {
-    Decimal::from(6)
-}
-
-fn default_trade_notional_usdt() -> Decimal {
-    Decimal::from(300)
-}
-
-fn default_telegram_subscribers_path() -> String {
-    "telegram_subscribers.json".to_string()
-}
-
-fn default_alert_diff_bps() -> Decimal {
-    Decimal::new(5, 1)
-}
+fn default_stats_csv_path() -> String { "stats_snapshots.csv".to_string() }
+fn default_slippage_csv_path() -> String { "slippage_events.csv".to_string() }
+fn default_mexc_taker_fee_bps() -> Decimal { Decimal::from(6) }
+fn default_trade_notional_usdt() -> Decimal { Decimal::from(300) }
+fn default_telegram_subscribers_path() -> String { "telegram_subscribers.json".to_string() }
+fn default_alert_diff_bps() -> Decimal { Decimal::new(5, 1) }
+fn default_alert_min_edge_bps() -> Decimal { Decimal::from(1) }
+fn default_alert_min_duration_ms() -> i64 { 500 }
+fn default_max_quote_age_ms() -> i64 { 2_000 }
+fn default_binance_idle_reconnect_ms() -> u64 { 10_000 }
+fn default_trade_vol() -> String { "1".to_string() }
+fn default_trade_leverage() -> i32 { 10 }
+fn default_trade_timeout_ms() -> u64 { 5000 }
 
 fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string("config.json").context("read config.json")?;
@@ -369,6 +513,12 @@ fn load_config() -> Result<Config> {
             }
             if let Some(v) = local.get("telegram_login_password").and_then(|x| x.as_str()) {
                 config.telegram_login_password = v.to_string();
+            }
+            if let Some(v) = local.get("mexc_api_key").and_then(|x| x.as_str()) {
+                config.mexc_api_key = v.to_string();
+            }
+            if let Some(v) = local.get("mexc_api_secret").and_then(|x| x.as_str()) {
+                config.mexc_api_secret = v.to_string();
             }
         }
     }
@@ -386,6 +536,170 @@ fn load_config() -> Result<Config> {
     anyhow::ensure!(!config.symbols.is_empty(), "config.symbols must not be empty");
     Ok(config)
 }
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+fn load_users() -> Vec<User> {
+    match std::fs::read_to_string("users.json") {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("[auth] failed to parse users.json: {e}");
+            Vec::new()
+        }),
+        Err(_) => {
+            eprintln!("[auth] users.json not found — run with --add-user to create accounts");
+            Vec::new()
+        }
+    }
+}
+
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| anyhow::anyhow!("hash error: {e}"))
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else { return false; };
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+}
+
+fn add_user_interactive() -> Result<()> {
+    const USERS_PATH: &str = "users.json";
+    let mut users: Vec<User> = if std::path::Path::new(USERS_PATH).exists() {
+        let text = std::fs::read_to_string(USERS_PATH)?;
+        serde_json::from_str(&text).context("parse users.json")?
+    } else {
+        Vec::new()
+    };
+
+    print!("Username: ");
+    std::io::stdout().flush()?;
+    let mut username = String::new();
+    std::io::stdin().read_line(&mut username)?;
+    let username = username.trim().to_string();
+    anyhow::ensure!(!username.is_empty(), "username cannot be empty");
+
+    let password = rpassword::prompt_password("Password: ")?;
+    anyhow::ensure!(!password.is_empty(), "password cannot be empty");
+
+    let hash = hash_password(&password)?;
+    users.retain(|u| u.username != username);
+    users.push(User { username: username.clone(), hash });
+    std::fs::write(USERS_PATH, serde_json::to_string_pretty(&users)?)?;
+    println!("User '{}' saved.", username);
+    Ok(())
+}
+
+// ── Auth middleware & handlers ────────────────────────────────────────────────
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if request.method() == axum::http::Method::OPTIONS {
+        return next.run(request).await;
+    }
+    let token = request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+
+    if let Some(token) = token {
+        let sessions = state.sessions.read().await;
+        if let Some(session) = sessions.get(&token) {
+            if now_ms() < session.expires_ms {
+                return next.run(request).await;
+            }
+        }
+    }
+    (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    token: String,
+}
+
+async fn login_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    let ip = addr.ip().to_string();
+    {
+        let attempts = state.login_attempts.lock().await;
+        if attempts.is_blocked(&ip) {
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts, wait 15 minutes").into_response();
+        }
+    }
+
+    let user = state.users.iter().find(|u| u.username == req.username).cloned();
+    let valid = match user {
+        Some(u) => {
+            let pw = req.password.clone();
+            let hash = u.hash.clone();
+            tokio::task::spawn_blocking(move || verify_password(&pw, &hash))
+                .await
+                .unwrap_or(false)
+        }
+        None => {
+            // Always burn argon2 time to prevent username enumeration via timing
+            let pw = req.password.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = Argon2::default().verify_password(
+                    pw.as_bytes(),
+                    &PasswordHash::new("$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObE").unwrap_or_else(|_| panic!()),
+                );
+            }).await;
+            false
+        }
+    };
+
+    if valid {
+        state.login_attempts.lock().await.record_success(&ip);
+        let token: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(64)
+            .map(|c| c as char)
+            .collect();
+        let expires_ms = now_ms() + 7 * 24 * 60 * 60 * 1_000;
+        state.sessions.write().await.insert(token.clone(), Session {
+            username: req.username,
+            expires_ms,
+        });
+        (StatusCode::OK, Json(LoginResponse { token })).into_response()
+    } else {
+        state.login_attempts.lock().await.record_failure(&ip);
+        (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+    }
+}
+
+async fn logout_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> StatusCode {
+    if let Some(token) = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        state.sessions.write().await.remove(token);
+    }
+    StatusCode::OK
+}
+
+// ── CSV helpers ───────────────────────────────────────────────────────────────
 
 fn open_stats_csv(path: &str) -> Result<File> {
     let exists = std::path::Path::new(path).exists();
@@ -423,6 +737,8 @@ fn open_csv(path: &str) -> Result<File> {
     Ok(file)
 }
 
+// ── Quote handling ────────────────────────────────────────────────────────────
+
 async fn handle_quote(
     update: QuoteUpdate,
     config: &Config,
@@ -430,7 +746,10 @@ async fn handle_quote(
     stats: &mut Stats,
     csv: &mut File,
     slippage_csv: &mut File,
+    trade_client: Option<Arc<MexcTradeClient>>,
+    live_cfg: &SharedLiveConfig,
 ) -> Result<()> {
+    let live = live_cfg.read().await.clone();
     let now = update.recv_ts_ms;
     let Some(state) = states.get_mut(&update.symbol) else {
         return Ok(());
@@ -442,104 +761,107 @@ async fn handle_quote(
             let prev = state.last_binance.clone();
             state.last_binance = Some(update.clone());
 
-            let Some(prev) = prev else { return Ok(()); };
-            let Some(mexc) = state.last_mexc.clone() else { return Ok(()); };
-            let elapsed = update.recv_ts_ms - prev.recv_ts_ms;
-            if elapsed < 0 || elapsed > config.impulse_window_ms {
-                return Ok(());
-            }
-            if now - state.last_event_ts_ms < config.event_cooldown_ms {
-                return Ok(());
-            }
+            'detect: {
+                let Some(prev) = prev else { break 'detect; };
+                let Some(mexc) = state.last_mexc.clone() else { break 'detect; };
+                let elapsed = update.recv_ts_ms - prev.recv_ts_ms;
+                if elapsed < 0 || elapsed > config.impulse_window_ms {
+                    break 'detect;
+                }
+                if now - state.last_event_ts_ms < config.event_cooldown_ms {
+                    break 'detect;
+                }
 
-            let prev_mid = prev.mid();
-            let new_mid = update.mid();
-            if prev_mid <= Decimal::ZERO || new_mid <= Decimal::ZERO {
-                return Ok(());
-            }
-            let move_bps = (new_mid - prev_mid) / prev_mid * Decimal::from(10_000);
-            let abs_move_bps = move_bps.abs();
-            if abs_move_bps < config.impulse_bps {
-                return Ok(());
-            }
+                let prev_mid = prev.mid();
+                let new_mid = update.mid();
+                if prev_mid <= Decimal::ZERO || new_mid <= Decimal::ZERO {
+                    break 'detect;
+                }
+                let move_bps = (new_mid - prev_mid) / prev_mid * Decimal::from(10_000);
+                let abs_move_bps = move_bps.abs();
+                if abs_move_bps < live.impulse_bps {
+                    break 'detect;
+                }
 
-            let direction = if move_bps > Decimal::ZERO { 1 } else { -1 };
-            state.pending = Some(PendingEvent {
-                symbol: update.symbol.clone(),
-                direction,
-                binance_start_mid: prev_mid,
-                binance_end_mid: new_mid,
-                mexc_start_mid: mexc.mid(),
-                mexc_start_bid: mexc.bid,
-                mexc_start_ask: mexc.ask,
-                binance_event_ts_ms: update.recv_ts_ms,
-                created_recv_ts_ms: now,
-            });
-            state.last_event_ts_ms = now;
-            stats.record_impulse(&update.symbol);
-
+                let direction = if move_bps > Decimal::ZERO { 1 } else { -1 };
+                state.pending = Some(PendingEvent {
+                    symbol: update.symbol.clone(),
+                    direction,
+                    binance_start_mid: prev_mid,
+                    binance_end_mid: new_mid,
+                    mexc_start_mid: mexc.mid(),
+                    mexc_start_bid: mexc.bid,
+                    mexc_start_ask: mexc.ask,
+                    binance_event_ts_ms: update.recv_ts_ms,
+                    created_recv_ts_ms: now,
+                });
+                state.last_event_ts_ms = now;
+                stats.record_impulse(&update.symbol);
+            }
         }
         Exchange::Mexc => {
             stats.record_quote(&update.symbol, Exchange::Mexc);
             state.last_mexc = Some(update.clone());
-            let Some(pending) = state.pending.clone() else { return Ok(()); };
 
-            if now - pending.created_recv_ts_ms > config.max_lag_ms {
+            'detect: {
+                let Some(pending) = state.pending.clone() else { break 'detect; };
+
+                if now - pending.created_recv_ts_ms > config.max_lag_ms {
+                    state.pending = None;
+                    stats.record_expired(&pending.symbol);
+                    break 'detect;
+                }
+
+                let start = pending.mexc_start_mid;
+                let current = update.mid();
+                if start <= Decimal::ZERO || current <= Decimal::ZERO {
+                    break 'detect;
+                }
+                let mexc_move_bps = (current - start) / start * Decimal::from(10_000);
+                let confirmed = if pending.direction > 0 {
+                    mexc_move_bps >= live.confirm_bps
+                } else {
+                    mexc_move_bps <= -live.confirm_bps
+                };
+                if !confirmed {
+                    break 'detect;
+                }
+
+                let binance_move_bps = (pending.binance_end_mid - pending.binance_start_mid)
+                    / pending.binance_start_mid
+                    * Decimal::from(10_000);
+                let record = LagRecord {
+                    symbol: pending.symbol.clone(),
+                    direction: pending.direction,
+                    lag_ms: update.recv_ts_ms - pending.binance_event_ts_ms,
+                    binance_move_bps,
+                    mexc_move_bps,
+                    binance_start_mid: pending.binance_start_mid,
+                    binance_end_mid: pending.binance_end_mid,
+                    mexc_start_mid: pending.mexc_start_mid,
+                    mexc_confirm_mid: current,
+                    binance_event_ts_ms: pending.binance_event_ts_ms,
+                    mexc_recv_ts_ms: update.recv_ts_ms,
+                };
+                write_record(csv, &record)?;
+                let estimate = write_slippage_record(slippage_csv, config, &live, &record, &pending, &update)?;
+                stats.set_trade_estimate(&record.symbol, estimate);
+                stats.add_lag(&record.symbol, record.lag_ms);
                 state.pending = None;
-                stats.record_expired(&pending.symbol);
-                return Ok(());
             }
-
-            let start = pending.mexc_start_mid;
-            let current = update.mid();
-            if start <= Decimal::ZERO || current <= Decimal::ZERO {
-                return Ok(());
-            }
-            let mexc_move_bps = (current - start) / start * Decimal::from(10_000);
-            let confirmed = if pending.direction > 0 {
-                mexc_move_bps >= config.confirm_bps
-            } else {
-                mexc_move_bps <= -config.confirm_bps
-            };
-            if !confirmed {
-                return Ok(());
-            }
-
-            let binance_move_bps = (pending.binance_end_mid - pending.binance_start_mid)
-                / pending.binance_start_mid
-                * Decimal::from(10_000);
-            let record = LagRecord {
-                symbol: pending.symbol.clone(),
-                direction: pending.direction,
-                lag_ms: update.recv_ts_ms - pending.binance_event_ts_ms,
-                binance_move_bps,
-                mexc_move_bps,
-                binance_start_mid: pending.binance_start_mid,
-                binance_end_mid: pending.binance_end_mid,
-                mexc_start_mid: pending.mexc_start_mid,
-                mexc_confirm_mid: current,
-                binance_event_ts_ms: pending.binance_event_ts_ms,
-                mexc_recv_ts_ms: update.recv_ts_ms,
-            };
-            write_record(csv, &record)?;
-            let estimate = write_slippage_record(slippage_csv, config, &record, &pending, &update)?;
-            stats.set_trade_estimate(&record.symbol, estimate);
-            stats.add_lag(&record.symbol, record.lag_ms);
-            state.pending = None;
-
         }
     }
 
-    check_price_diff_alert(&update.symbol, config, state).await;
+    check_price_diff_alert(&update.symbol, config, &live, state, trade_client).await;
 
     Ok(())
 }
 
-async fn check_price_diff_alert(symbol: &str, config: &Config, state: &mut SymbolState) {
+async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig, state: &mut SymbolState, trade_client: Option<Arc<MexcTradeClient>>) {
     let (Some(binance), Some(mexc)) = (state.last_binance.as_ref(), state.last_mexc.as_ref()) else {
         return;
     };
-    if config.alert_diff_bps <= Decimal::ZERO {
+    if live.alert_diff_bps <= Decimal::ZERO {
         return;
     }
 
@@ -552,16 +874,91 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, state: &mut Symbo
     let diff_usdt = m_mid - b_mid;
     let diff_bps = diff_usdt / b_mid * Decimal::from(10_000);
     let abs_diff_bps = diff_bps.abs();
+    let edge = estimate_diff_edge(binance, mexc, diff_bps, live.trade_notional_usdt);
     let now = now_ms();
+    let binance_age_ms = now - binance.recv_ts_ms;
+    let mexc_age_ms = now - mexc.recv_ts_ms;
+    if binance_age_ms < 0
+        || mexc_age_ms < 0
+        || binance_age_ms > config.max_quote_age_ms
+        || mexc_age_ms > config.max_quote_age_ms
+    {
+        if let Some(tx) = state.active_trade_close.take() {
+            let _ = tx.send(());
+        }
+        if state.active_diff_alert.take().is_some() {
+            state.last_diff_alert_closed_ms = now;
+            eprintln!(
+                "[alert] stale quote close {symbol}: binance_age={binance_age_ms}ms mexc_age={mexc_age_ms}ms max={}ms",
+                config.max_quote_age_ms
+            );
+        }
+        return;
+    }
 
-    if abs_diff_bps >= config.alert_diff_bps {
+    if abs_diff_bps >= live.alert_diff_bps {
         match state.active_diff_alert.as_mut() {
             Some(active) => {
                 if abs_diff_bps > active.max_abs_diff_bps {
                     active.max_abs_diff_bps = abs_diff_bps;
                 }
+                if edge.edge_zero_fee_bps > active.max_edge_zero_fee_bps {
+                    active.max_edge_zero_fee_bps = edge.edge_zero_fee_bps;
+                }
+
+                let duration_ms = now - active.started_ms;
+                if !active.notified
+                    && duration_ms >= config.alert_min_duration_ms
+                    && edge.edge_zero_fee_bps >= config.alert_min_edge_bps
+                    && active.max_edge_zero_fee_bps >= config.alert_min_edge_bps
+                {
+                    active.notified = true;
+                    let diff_pct = diff_bps / Decimal::from(100);
+                    let thr_pct = live.alert_diff_bps / Decimal::from(100);
+                    let text = format!(
+                        "💎 Ценная разница {symbol}\n{direction}\nДержится: {secs:.2} сек\nBinance mid: {b}\nMEXC mid: {m}\nMEXC bid/ask: {bid} / {ask}\nРазница сейчас: {du} USDT / {dp}% ({dbps} bps)\nПорог: {thr}%\nСпред MEXC: {spread} bps\n0 fee edge старт/макс/сейчас: {start_edge} / {max_edge} / {edge_bps} bps\nPnL 0 fee сейчас: {pnl} USDT",
+                        symbol = symbol,
+                        direction = active.direction,
+                        secs = duration_ms as f64 / 1000.0,
+                        b = b_mid.round_dp(6),
+                        m = m_mid.round_dp(6),
+                        bid = mexc.bid.round_dp(8),
+                        ask = mexc.ask.round_dp(8),
+                        du = diff_usdt.round_dp(6),
+                        dp = diff_pct.round_dp(4),
+                        dbps = diff_bps.round_dp(3),
+                        thr = thr_pct.round_dp(4),
+                        spread = edge.mexc_spread_bps.round_dp(3),
+                        start_edge = active.start_edge_zero_fee_bps.round_dp(3),
+                        max_edge = active.max_edge_zero_fee_bps.round_dp(3),
+                        edge_bps = edge.edge_zero_fee_bps.round_dp(3),
+                        pnl = edge.pnl_zero_fee_usdt.round_dp(4),
+                    );
+                    send_telegram_to_subscribers(config, &text).await;
+
+                    if live.trade_enabled && state.active_trade_close.is_none() {
+                        if let Some(client) = trade_client.clone() {
+                            let trade_direction = if diff_usdt < Decimal::ZERO { 1 } else { -1 };
+                            let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+                            state.active_trade_close = Some(close_tx);
+                            tokio::spawn(client.run_trade(
+                                symbol.to_string(),
+                                trade_direction,
+                                m_mid,
+                                b_mid,
+                                config.trade_vol.clone(),
+                                config.trade_leverage,
+                                config.trade_timeout_ms,
+                                close_rx,
+                            ));
+                        }
+                    }
+                }
             }
             None => {
+                if now - state.last_diff_alert_closed_ms < 60_000 {
+                    return;
+                }
                 let direction = if diff_usdt > Decimal::ZERO {
                     "MEXC выше Binance".to_string()
                 } else {
@@ -573,34 +970,61 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, state: &mut Symbo
                     start_diff_bps: diff_bps,
                     start_diff_usdt: diff_usdt,
                     max_abs_diff_bps: abs_diff_bps,
+                    start_edge_zero_fee_bps: edge.edge_zero_fee_bps,
+                    max_edge_zero_fee_bps: edge.edge_zero_fee_bps,
+                    notified: false,
                 });
-                let text = format!(
-                    "Найдена разница {symbol}\n{direction}\nBinance: {b}\nMEXC: {m}\nРазница: {du} USDT / {db} bps\nПорог: {thr} bps",
-                    symbol = symbol,
-                    direction = direction,
-                    b = b_mid.round_dp(6),
-                    m = m_mid.round_dp(6),
-                    du = diff_usdt.round_dp(6),
-                    db = diff_bps.round_dp(3),
-                    thr = config.alert_diff_bps,
-                );
-                send_telegram_to_subscribers(config, &text).await;
             }
         }
     } else if let Some(active) = state.active_diff_alert.take() {
+        state.last_diff_alert_closed_ms = now;
+        if let Some(tx) = state.active_trade_close.take() {
+            let _ = tx.send(());
+        }
+        if !active.notified {
+            return;
+        }
         let duration_ms = now - active.started_ms;
+        let start_pct = active.start_diff_bps / Decimal::from(100);
+        let max_pct = active.max_abs_diff_bps / Decimal::from(100);
+        let final_pct = diff_bps / Decimal::from(100);
         let text = format!(
-            "Разница закрылась {symbol}\nНаправление: {direction}\nДержалась: {secs:.2} сек\nСтарт: {start_usdt} USDT / {start_bps} bps\nМакс: {max_bps} bps\nФинал: {final_usdt} USDT / {final_bps} bps",
+            "Разница закрылась {symbol}\nНаправление: {direction}\nДержалась: {secs:.2} сек\nСтарт: {start_usdt} USDT / {start_pct}% ({start_bps} bps)\nМакс: {max_pct}% ({max_bps} bps)\nФинал: {final_usdt} USDT / {final_pct}% ({final_bps} bps)\nСпред MEXC сейчас: {spread} bps\nОценка 0 fee старт/макс/финал: {start_edge} / {max_edge} / {final_edge} bps\nPnL 0 fee финал: {final_pnl} USDT",
             symbol = symbol,
             direction = active.direction,
             secs = duration_ms as f64 / 1000.0,
             start_usdt = active.start_diff_usdt.round_dp(6),
+            start_pct = start_pct.round_dp(4),
             start_bps = active.start_diff_bps.round_dp(3),
+            max_pct = max_pct.round_dp(4),
             max_bps = active.max_abs_diff_bps.round_dp(3),
             final_usdt = diff_usdt.round_dp(6),
+            final_pct = final_pct.round_dp(4),
             final_bps = diff_bps.round_dp(3),
+            spread = edge.mexc_spread_bps.round_dp(3),
+            start_edge = active.start_edge_zero_fee_bps.round_dp(3),
+            max_edge = active.max_edge_zero_fee_bps.round_dp(3),
+            final_edge = edge.edge_zero_fee_bps.round_dp(3),
+            final_pnl = edge.pnl_zero_fee_usdt.round_dp(4),
         );
         send_telegram_to_subscribers(config, &text).await;
+    }
+}
+
+fn estimate_diff_edge(binance: &QuoteUpdate, mexc: &QuoteUpdate, diff_bps: Decimal, notional_usdt: Decimal) -> DiffEdgeEstimate {
+    let b_mid = binance.mid();
+    let mexc_spread_bps = spread_bps(mexc.bid, mexc.ask);
+    let edge_zero_fee_bps = if b_mid <= Decimal::ZERO {
+        Decimal::ZERO
+    } else if diff_bps < Decimal::ZERO {
+        (b_mid - mexc.ask) / b_mid * Decimal::from(10_000)
+    } else {
+        (mexc.bid - b_mid) / b_mid * Decimal::from(10_000)
+    };
+    DiffEdgeEstimate {
+        mexc_spread_bps,
+        edge_zero_fee_bps,
+        pnl_zero_fee_usdt: notional_usdt * edge_zero_fee_bps / Decimal::from(10_000),
     }
 }
 
@@ -624,6 +1048,7 @@ async fn send_telegram_to_subscribers(config: &Config, text: &str) {
         }
     }
 }
+
 fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
     let now = now_ms();
     for (symbol, state) in states.iter_mut() {
@@ -755,6 +1180,7 @@ fn write_stats_snapshot(
     file.flush()?;
     Ok(())
 }
+
 fn spread_bps(bid: Decimal, ask: Decimal) -> Decimal {
     let mid = (bid + ask) / Decimal::from(2);
     if mid <= Decimal::ZERO {
@@ -767,6 +1193,7 @@ fn spread_bps(bid: Decimal, ask: Decimal) -> Decimal {
 fn write_slippage_record(
     file: &mut File,
     config: &Config,
+    live: &LiveConfig,
     r: &LagRecord,
     pending: &PendingEvent,
     mexc_confirm: &QuoteUpdate,
@@ -792,8 +1219,8 @@ fn write_slippage_record(
 
     let fees_bps = config.mexc_taker_fee_bps * Decimal::from(2);
     let net_cross_bps = gross_cross_bps - fees_bps;
-    let estimated_pnl_usdt = config.trade_notional_usdt * net_cross_bps / Decimal::from(10_000);
-    let pnl_zero_fee_usdt = config.trade_notional_usdt * gross_cross_bps / Decimal::from(10_000);
+    let estimated_pnl_usdt = live.trade_notional_usdt * net_cross_bps / Decimal::from(10_000);
+    let pnl_zero_fee_usdt = live.trade_notional_usdt * gross_cross_bps / Decimal::from(10_000);
 
     writeln!(
         file,
@@ -827,6 +1254,7 @@ fn write_slippage_record(
         pnl_zero_fee_usdt,
     })
 }
+
 fn write_record(csv: &mut File, r: &LagRecord) -> Result<()> {
     writeln!(
         csv,
@@ -848,13 +1276,37 @@ fn write_record(csv: &mut File, r: &LagRecord) -> Result<()> {
     Ok(())
 }
 
+// ── WebSocket feeds ───────────────────────────────────────────────────────────
+
 async fn run_binance(config: Config, tx: mpsc::Sender<QuoteUpdate>) {
-    let symbols: HashSet<String> = config.symbols.iter().cloned().collect();
-    let url = format!("{}?streams=!bookTicker", config.binance_ws);
+    for symbol in config.symbols.clone() {
+        let tx = tx.clone();
+        let base_url = config.binance_ws.clone();
+        let idle_reconnect_ms = config.binance_idle_reconnect_ms;
+        tokio::spawn(async move {
+            let mut symbols = HashSet::new();
+            symbols.insert(symbol.clone());
+            let stream = format!("{}@bookTicker", binance_stream_symbol(&symbol));
+            let url = format!("{}?streams={}", base_url, stream);
+            loop {
+                eprintln!("[binance] connecting stream: {stream}");
+                if let Err(e) = binance_session(&url, &symbols, &tx, idle_reconnect_ms).await {
+                    eprintln!("[binance] session error {symbol}: {e:#}");
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
 
     loop {
-        let _ = binance_session(&url, &symbols, &tx).await;
-        sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+fn binance_stream_symbol(symbol: &str) -> String {
+    match symbol {
+        "PEPE_USDT" => "1000pepeusdt".to_string(),
+        _ => symbol.replace('_', "").to_ascii_lowercase(),
     }
 }
 
@@ -862,16 +1314,35 @@ async fn binance_session(
     url: &str,
     symbols: &HashSet<String>,
     tx: &mpsc::Sender<QuoteUpdate>,
+    idle_reconnect_ms: u64,
 ) -> Result<()> {
     let (ws, _) = connect_async(url).await?;
     let (_, mut read) = ws.split();
+    let idle_reconnect = Duration::from_millis(idle_reconnect_ms);
+    let mut idle_tick = tokio::time::interval(idle_reconnect);
 
-    while let Some(msg) = read.next().await {
-        let msg = msg?;
-        if let Message::Text(text) = msg {
-            for update in parse_binance_book_tickers(&text) {
-                if symbols.contains(&update.symbol) && tx.send(update).await.is_err() {
-                    break;
+    loop {
+        tokio::select! {
+            _ = idle_tick.tick() => {
+                eprintln!("[binance] idle reconnect after {idle_reconnect_ms}ms");
+                break;
+            }
+            msg = read.next() => {
+                let Some(msg) = msg else { break; };
+                let msg = msg?;
+                if let Message::Text(text) = msg {
+                    let mut sent_any = false;
+                    for update in parse_binance_book_tickers(&text) {
+                        if symbols.contains(&update.symbol) {
+                            sent_any = true;
+                            if tx.send(update).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    if sent_any {
+                        idle_tick.reset();
+                    }
                 }
             }
         }
@@ -922,6 +1393,8 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
     Ok(())
 }
 
+// ── Parsers ───────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Deserialize)]
 struct BinanceBookTicker {
     #[serde(rename = "s")]
@@ -949,8 +1422,12 @@ fn parse_binance_book_tickers(text: &str) -> Vec<QuoteUpdate> {
 
 fn parse_binance_book_ticker_value(value: serde_json::Value) -> Option<QuoteUpdate> {
     let data: BinanceBookTicker = serde_json::from_value(value).ok()?;
-    let bid = Decimal::from_str(&data.bid).ok()?;
-    let ask = Decimal::from_str(&data.ask).ok()?;
+    let mut bid = Decimal::from_str(&data.bid).ok()?;
+    let mut ask = Decimal::from_str(&data.ask).ok()?;
+    if data.symbol == "1000PEPEUSDT" {
+        bid /= Decimal::from(1000);
+        ask /= Decimal::from(1000);
+    }
     if bid <= Decimal::ZERO || ask <= Decimal::ZERO || bid >= ask {
         return None;
     }
@@ -1002,15 +1479,14 @@ fn best_price(levels: &[Vec<Decimal>], is_bid: bool) -> Option<Decimal> {
         .filter_map(|level| level.first().copied())
         .filter(|p| *p > Decimal::ZERO)
         .reduce(|best, price| {
-            if is_bid {
-                best.max(price)
-            } else {
-                best.min(price)
-            }
+            if is_bid { best.max(price) } else { best.min(price) }
         })
 }
 
 fn normalize_binance_symbol(symbol: &str) -> String {
+    if symbol == "1000PEPEUSDT" {
+        return "PEPE_USDT".to_string();
+    }
     symbol
         .strip_suffix("USDT")
         .map(|base| format!("{}_USDT", base))
@@ -1021,24 +1497,11 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// ── Dashboard snapshot ────────────────────────────────────────────────────────
 
 fn build_dashboard_snapshot(
     config: &Config,
+    live: &LiveConfig,
     states: &HashMap<String, SymbolState>,
     stats: &Stats,
 ) -> DashboardSnapshot {
@@ -1095,28 +1558,52 @@ fn build_dashboard_snapshot(
     DashboardSnapshot {
         updated_at: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         summary: stats.summary(),
-        impulse_bps: config.impulse_bps.to_string(),
-        confirm_bps: config.confirm_bps.to_string(),
+        impulse_bps: live.impulse_bps.to_string(),
+        confirm_bps: live.confirm_bps.to_string(),
         max_lag_ms: config.max_lag_ms,
         symbols,
     }
 }
 
-async fn run_dashboard(state: SharedDashboard) {
+// ── HTTP server ───────────────────────────────────────────────────────────────
+
+async fn run_dashboard(state: AppState) {
+    let protected = Router::new()
+        .route("/api/state", get(dashboard_state))
+        .route("/api/config", get(config_get).post(config_post))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
+
     let app = Router::new()
         .route("/", get(dashboard_html))
-        .route("/api/state", get(dashboard_state))
+        .route("/api/login", post(login_handler))
+        .route("/api/logout", post(logout_handler))
+        .merge(protected)
         .layer(CorsLayer::permissive())
         .with_state(state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8787));
     let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
+        eprintln!("[dashboard] failed to bind {addr}");
         return;
     };
-    let _ = axum::serve(listener, app).await;
+    eprintln!("[dashboard] listening on {addr}");
+    let _ = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    ).await;
 }
 
-async fn dashboard_state(State(state): State<SharedDashboard>) -> Json<DashboardSnapshot> {
-    Json(state.read().await.clone())
+async fn dashboard_state(State(state): State<AppState>) -> Json<DashboardSnapshot> {
+    Json(state.dashboard.read().await.clone())
+}
+
+async fn config_get(State(state): State<AppState>) -> Json<LiveConfig> {
+    Json(state.live_cfg.read().await.clone())
+}
+
+async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConfig>) -> Json<LiveConfig> {
+    *state.live_cfg.write().await = new_cfg.clone();
+    Json(new_cfg)
 }
 
 async fn dashboard_html() -> Html<&'static str> {
@@ -1141,6 +1628,8 @@ fn open_dashboard_in_browser() {
     });
 }
 
+// ── Dashboard HTML ────────────────────────────────────────────────────────────
+
 const DASHBOARD_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -1150,9 +1639,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <style>
     :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background:#0f1115; color:#e7eaf0; }
     body { margin:0; background:#0f1115; }
-    header { position:sticky; top:0; background:#151923; border-bottom:1px solid #2a3040; padding:14px 18px; z-index:2; }
-    h1 { margin:0 0 8px; font-size:20px; font-weight:650; }
+    header { position:sticky; top:0; background:#151923; border-bottom:1px solid #2a3040; padding:14px 18px; z-index:2; display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .header-left h1 { margin:0 0 8px; font-size:20px; font-weight:650; }
     .meta { display:flex; flex-wrap:wrap; gap:10px 18px; color:#aab3c5; font-size:13px; }
+    .settings { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; padding:10px 18px; background:#111622; border-bottom:1px solid #2a3040; font-size:13px; }
+    .settings label { display:flex; align-items:center; gap:6px; color:#aab3c5; }
+    .settings input[type=number] { width:80px; background:#1a2030; border:1px solid #3a4558; border-radius:4px; color:#e7eaf0; padding:3px 6px; font-size:13px; }
+    .settings input[type=checkbox] { accent-color:#4a90d9; width:15px; height:15px; }
+    .settings button { background:#2a5298; border:none; border-radius:4px; color:#fff; padding:5px 14px; cursor:pointer; font-size:13px; }
+    .settings button:hover { background:#3a6ab8; }
+    .cfg-status { color:#6dbf6d; font-size:12px; min-width:50px; }
     main { padding:16px 18px 28px; }
     .summary { display:grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap:10px; margin-bottom:14px; }
     .box { background:#171c27; border:1px solid #2a3040; border-radius:6px; padding:10px 12px; }
@@ -1164,19 +1660,61 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     tr.hot td { background:#18251d; }
     tr.pending td { background:#242016; }
     a { color:#8fb7ff; text-decoration:none; }
-    .links { margin-top:12px; display:flex; gap:14px; color:#aab3c5; font-size:13px; }
     .muted { color:#7d8799; }
+    .btn-logout { background:transparent; border:1px solid #3a4558; border-radius:4px; color:#aab3c5; padding:5px 12px; cursor:pointer; font-size:12px; white-space:nowrap; }
+    .btn-logout:hover { background:#1e2535; color:#e7eaf0; }
+    /* Login overlay */
+    .overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:200; align-items:center; justify-content:center; }
+    .overlay.active { display:flex; }
+    .login-card { background:#151923; border:1px solid #2a3040; border-radius:8px; padding:36px 40px; min-width:300px; max-width:380px; width:100%; }
+    .login-card h2 { margin:0 0 24px; font-size:18px; font-weight:600; }
+    .field { display:flex; flex-direction:column; gap:6px; margin-bottom:16px; }
+    .field label { color:#aab3c5; font-size:13px; }
+    .field input { background:#1a2030; border:1px solid #3a4558; border-radius:4px; color:#e7eaf0; padding:9px 11px; font-size:14px; outline:none; }
+    .field input:focus { border-color:#4a90d9; }
+    .btn-primary { width:100%; background:#2a5298; border:none; border-radius:4px; color:#fff; padding:10px; cursor:pointer; font-size:14px; margin-top:4px; }
+    .btn-primary:hover { background:#3a6ab8; }
+    .login-err { color:#e06060; font-size:13px; margin-top:10px; min-height:18px; }
   </style>
 </head>
 <body>
-<header>
-  <h1>Монитор задержки Binance -> MEXC</h1>
-  <div class="meta">
-    <span id="updated">ожидание данных</span>
-    <span id="thresholds"></span>
-    <span>Файлы: lag_events.csv / slippage_events.csv / stats_snapshots.csv</span>
+
+<div class="overlay" id="loginOverlay">
+  <div class="login-card">
+    <h2>Вход</h2>
+    <div class="field">
+      <label>Логин</label>
+      <input type="text" id="loginUser" autocomplete="username" />
+    </div>
+    <div class="field">
+      <label>Пароль</label>
+      <input type="password" id="loginPass" autocomplete="current-password" />
+    </div>
+    <button class="btn-primary" onclick="doLogin()">Войти</button>
+    <div class="login-err" id="loginErr"></div>
   </div>
+</div>
+
+<header>
+  <div class="header-left">
+    <h1>Монитор задержки Binance -> MEXC</h1>
+    <div class="meta">
+      <span id="updated">ожидание данных</span>
+      <span id="thresholds"></span>
+      <span>Файлы: lag_events.csv / slippage_events.csv / stats_snapshots.csv</span>
+    </div>
+  </div>
+  <button class="btn-logout" onclick="doLogout()">Выйти</button>
 </header>
+<div class="settings">
+  <label>Notional (USDT): <input id="cfgNotional" type="number" min="1" step="10"></label>
+  <label>Impulse (bps): <input id="cfgImpulse" type="number" min="0.1" step="0.1"></label>
+  <label>Confirm (bps): <input id="cfgConfirm" type="number" min="0.1" step="0.1"></label>
+  <label>Alert diff (bps): <input id="cfgAlert" type="number" min="0.1" step="0.1"></label>
+  <label>Trading: <input id="cfgTrade" type="checkbox"></label>
+  <button onclick="saveConfig()">Apply</button>
+  <span class="cfg-status" id="cfgStatus"></span>
+</div>
 <main>
   <section class="summary">
     <div class="box">Тики Binance<b id="binanceQuotes">0</b></div>
@@ -1192,11 +1730,92 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   </table>
 </main>
 <script>
+const TOKEN_KEY = 'dashboard_token';
+function tok() { return sessionStorage.getItem(TOKEN_KEY); }
+function authH() { const t = tok(); return t ? {'Authorization': 'Bearer ' + t} : {}; }
+function showLogin() {
+  document.getElementById('loginOverlay').classList.add('active');
+  setTimeout(() => document.getElementById('loginUser').focus(), 50);
+}
+function hideLogin() { document.getElementById('loginOverlay').classList.remove('active'); }
+function handle401() { sessionStorage.removeItem(TOKEN_KEY); showLogin(); }
+
+async function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  const err = document.getElementById('loginErr');
+  err.textContent = '';
+  if (!u || !p) { err.textContent = 'Заполните все поля'; return; }
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: u, password: p})
+    });
+    if (r.ok) {
+      const d = await r.json();
+      sessionStorage.setItem(TOKEN_KEY, d.token);
+      document.getElementById('loginPass').value = '';
+      hideLogin();
+      loadConfig();
+    } else if (r.status === 429) {
+      err.textContent = 'Слишком много попыток. Подождите 15 минут.';
+    } else {
+      err.textContent = 'Неверный логин или пароль';
+    }
+  } catch { err.textContent = 'Ошибка соединения'; }
+}
+
+function doLogout() {
+  const t = tok();
+  if (t) fetch('/api/logout', {method: 'POST', headers: authH()}).catch(() => {});
+  sessionStorage.removeItem(TOKEN_KEY);
+  showLogin();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && document.getElementById('loginOverlay').classList.contains('active')) doLogin();
+});
+
 function fmt(v, suffix='') { return v === null || v === undefined ? '-' : `${v}${suffix}`; }
 function sum(rows, key) { return rows.reduce((a, r) => a + (r[key] || 0), 0); }
+
+async function loadConfig() {
+  const r = await fetch('/api/config', {headers: authH()}).catch(() => null);
+  if (!r || r.status === 401) { handle401(); return; }
+  const c = await r.json();
+  document.getElementById('cfgNotional').value = c.trade_notional_usdt;
+  document.getElementById('cfgImpulse').value = c.impulse_bps;
+  document.getElementById('cfgConfirm').value = c.confirm_bps;
+  document.getElementById('cfgAlert').value = c.alert_diff_bps;
+  document.getElementById('cfgTrade').checked = c.trade_enabled;
+}
+
+async function saveConfig() {
+  const body = {
+    trade_notional_usdt: parseFloat(document.getElementById('cfgNotional').value),
+    impulse_bps: parseFloat(document.getElementById('cfgImpulse').value),
+    confirm_bps: parseFloat(document.getElementById('cfgConfirm').value),
+    alert_diff_bps: parseFloat(document.getElementById('cfgAlert').value),
+    trade_enabled: document.getElementById('cfgTrade').checked,
+  };
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: Object.assign({'Content-Type': 'application/json'}, authH()),
+    body: JSON.stringify(body)
+  }).catch(() => null);
+  if (!r || r.status === 401) { handle401(); return; }
+  const st = document.getElementById('cfgStatus');
+  st.textContent = r.ok ? 'Saved ✓' : 'Error ✗';
+  st.style.color = r.ok ? '#6dbf6d' : '#e06060';
+  setTimeout(() => { st.textContent = ''; }, 2500);
+}
+
 async function refresh() {
-  const res = await fetch('/api/state', { cache: 'no-store' });
-  const data = await res.json();
+  const r = await fetch('/api/state', {cache: 'no-store', headers: authH()}).catch(() => null);
+  if (!r) return;
+  if (r.status === 401) { handle401(); return; }
+  const data = await r.json();
   const rows = data.symbols || [];
   document.getElementById('updated').textContent = `Обновлено: ${data.updated_at || '-'}`;
   document.getElementById('thresholds').textContent = `импульс ${data.impulse_bps} bps | подтверждение ${data.confirm_bps} bps | макс. задержка ${data.max_lag_ms} мс`;
@@ -1213,20 +1832,15 @@ async function refresh() {
       <td>${fmt(r.pending === 'UP' ? 'ВВЕРХ' : (r.pending === 'DOWN' ? 'ВНИЗ' : r.pending))}</td>
     </tr>`).join('');
 }
+
+if (tok()) { loadConfig(); } else { showLogin(); }
 setInterval(refresh, 1000);
 refresh();
 </script>
 </body>
 </html>"#;
 
-
-
-
-
-
-
-
-
+// ── Telegram ──────────────────────────────────────────────────────────────────
 
 fn load_telegram_subscribers(path: &str) -> Vec<String> {
     std::fs::read_to_string(path)
@@ -1245,6 +1859,10 @@ async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Re
     if config.telegram_bot_token.is_empty() || chat_id.is_empty() {
         return Ok(());
     }
+    let blocked_until = TELEGRAM_BLOCKED_UNTIL_MS.load(Ordering::Relaxed);
+    if now_ms() < blocked_until {
+        anyhow::bail!("rate limited for {}ms", blocked_until - now_ms());
+    }
     let url = format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_bot_token);
     let client = reqwest::Client::new();
     let resp = client
@@ -1260,6 +1878,13 @@ async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Re
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 429 {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(retry_after) = v.pointer("/parameters/retry_after").and_then(|x| x.as_i64()) {
+                    TELEGRAM_BLOCKED_UNTIL_MS.store(now_ms() + retry_after * 1000, Ordering::Relaxed);
+                }
+            }
+        }
         anyhow::bail!("telegram sendMessage HTTP {}: {}", status, body);
     }
     Ok(())
@@ -1333,11 +1958,3 @@ async fn run_telegram_login_bot(config: Config) {
         sleep(Duration::from_secs(2)).await;
     }
 }
-
-
-
-
-
-
-
-
