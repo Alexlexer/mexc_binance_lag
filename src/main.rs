@@ -1795,8 +1795,10 @@ const TOKEN_KEY = 'dashboard_token';
 function tok() { return sessionStorage.getItem(TOKEN_KEY); }
 function authH() { const t = tok(); return t ? {'Authorization': 'Bearer ' + t} : {}; }
 function showLogin() {
-  document.getElementById('loginOverlay').classList.add('active');
-  setTimeout(() => document.getElementById('loginUser').focus(), 50);
+  const overlay = document.getElementById('loginOverlay');
+  const alreadyVisible = overlay.classList.contains('active');
+  overlay.classList.add('active');
+  if (!alreadyVisible) setTimeout(() => document.getElementById('loginUser').focus(), 50);
 }
 function hideLogin() { document.getElementById('loginOverlay').classList.remove('active'); }
 function handle401() { sessionStorage.removeItem(TOKEN_KEY); showLogin(); }
