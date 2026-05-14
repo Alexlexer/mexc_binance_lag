@@ -986,7 +986,7 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
                         edge_bps = edge.edge_zero_fee_bps.round_dp(3),
                         pnl = edge.pnl_zero_fee_usdt.round_dp(4),
                     );
-                    send_telegram_to_subscribers(config, &text).await;
+                    send_telegram_to_subscribers(config, &text);
 
                     if live.trade_enabled && state.active_trade_close.is_none() {
                         if let Some(client) = trade_client.clone() {
@@ -1059,7 +1059,7 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
             final_edge = edge.edge_zero_fee_bps.round_dp(3),
             final_pnl = edge.pnl_zero_fee_usdt.round_dp(4),
         );
-        send_telegram_to_subscribers(config, &text).await;
+        send_telegram_to_subscribers(config, &text);
     }
 }
 
@@ -1080,25 +1080,24 @@ fn estimate_diff_edge(binance: &QuoteUpdate, mexc: &QuoteUpdate, diff_bps: Decim
     }
 }
 
-async fn send_telegram_to_subscribers(config: &Config, text: &str) {
+fn send_telegram_to_subscribers(config: &Config, text: &str) {
     if config.telegram_bot_token.is_empty() {
-        eprintln!("[telegram] skip send: bot token is empty");
         return;
     }
     let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
     if subscribers.is_empty() {
-        eprintln!(
-            "[telegram] skip send: no subscribers in {}",
-            config.telegram_subscribers_path
-        );
         return;
     }
+    let token = config.telegram_bot_token.clone();
+    let text = text.to_string();
     eprintln!("[telegram] sending alert to {} subscriber(s)", subscribers.len());
-    for chat_id in subscribers {
-        if let Err(e) = telegram_send_message(config, &chat_id, text).await {
-            eprintln!("[telegram] send to {} failed: {:#}", chat_id, e);
+    tokio::spawn(async move {
+        for chat_id in subscribers {
+            if let Err(e) = telegram_send_raw(&token, &chat_id, &text).await {
+                eprintln!("[telegram] send to {} failed: {:#}", chat_id, e);
+            }
         }
-    }
+    });
 }
 
 fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
@@ -1921,15 +1920,15 @@ fn save_telegram_subscribers(path: &str, subscribers: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn telegram_send_message(config: &Config, chat_id: &str, text: &str) -> Result<()> {
-    if config.telegram_bot_token.is_empty() || chat_id.is_empty() {
+async fn telegram_send_raw(token: &str, chat_id: &str, text: &str) -> Result<()> {
+    if token.is_empty() || chat_id.is_empty() {
         return Ok(());
     }
     let blocked_until = TELEGRAM_BLOCKED_UNTIL_MS.load(Ordering::Relaxed);
     if now_ms() < blocked_until {
         anyhow::bail!("rate limited for {}ms", blocked_until - now_ms());
     }
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_bot_token);
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     let client = reqwest::Client::new();
     let resp = client
         .post(url)
@@ -1990,7 +1989,7 @@ async fn run_telegram_login_bot(config: Config) {
                             let mut subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
                             subscribers.retain(|x| x != &chat_id);
                             let _ = save_telegram_subscribers(&config.telegram_subscribers_path, &subscribers);
-                            let _ = telegram_send_message(&config, &chat_id, "Вы вышли из рассылки отчетов.").await;
+                            let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, "Вы вышли из рассылки отчетов.").await;
                             continue;
                         }
 
@@ -2001,7 +2000,7 @@ async fn run_telegram_login_bot(config: Config) {
                             } else {
                                 "Вы не залогинены. Используйте /login password."
                             };
-                            let _ = telegram_send_message(&config, &chat_id, msg).await;
+                            let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, msg).await;
                             continue;
                         }
 
@@ -2012,9 +2011,9 @@ async fn run_telegram_login_bot(config: Config) {
                                     subscribers.push(chat_id.clone());
                                     let _ = save_telegram_subscribers(&config.telegram_subscribers_path, &subscribers);
                                 }
-                                let _ = telegram_send_message(&config, &chat_id, "Логин успешен. Вы будете получать отчеты каждые 5 часов.").await;
+                                let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, "Логин успешен. Вы будете получать отчеты каждые 5 часов.").await;
                             } else {
-                                let _ = telegram_send_message(&config, &chat_id, "Неверный пароль.").await;
+                                let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, "Неверный пароль.").await;
                             }
                         }
                     }
