@@ -80,6 +80,7 @@ type SharedLoginAttempts = Arc<Mutex<LoginAttempts>>;
 // ── Dashboard / app state ────────────────────────────────────────────────────
 
 type SharedDashboard = Arc<RwLock<DashboardSnapshot>>;
+type SharedTradeClient = Arc<RwLock<Option<Arc<MexcTradeClient>>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LiveConfig {
@@ -99,6 +100,7 @@ struct AppState {
     sessions: SharedSessions,
     users: Arc<Vec<User>>,
     login_attempts: SharedLoginAttempts,
+    trade_client: SharedTradeClient,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -425,12 +427,22 @@ async fn main() -> Result<()> {
     let sessions: SharedSessions = Arc::new(RwLock::new(HashMap::new()));
     let login_attempts: SharedLoginAttempts = Arc::new(Mutex::new(LoginAttempts::default()));
 
+    let initial_client: Option<Arc<MexcTradeClient>> = if !config.mexc_api_key.is_empty() {
+        eprintln!("[trade] API keys loaded, client active");
+        Some(Arc::new(MexcTradeClient::new(config.mexc_api_key.clone(), config.mexc_api_secret.clone(), 1)))
+    } else {
+        eprintln!("[trade] no API keys — set them in the dashboard");
+        None
+    };
+    let trade_client: SharedTradeClient = Arc::new(RwLock::new(initial_client));
+
     let app_state = AppState {
         dashboard: dashboard.clone(),
         live_cfg: live_cfg.clone(),
         sessions,
         users: Arc::new(users),
         login_attempts,
+        trade_client: trade_client.clone(),
     };
 
     tokio::spawn(run_dashboard(app_state));
@@ -440,14 +452,6 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<QuoteUpdate>(20_000);
     tokio::spawn(run_binance(config.clone(), tx.clone()));
     tokio::spawn(run_mexc(config.clone(), tx));
-
-    let trade_client: Option<Arc<MexcTradeClient>> = if config.trade_enabled && !config.mexc_api_key.is_empty() {
-        eprintln!("[trade] enabled, max 1 position");
-        Some(Arc::new(MexcTradeClient::new(config.mexc_api_key.clone(), config.mexc_api_secret.clone(), 1)))
-    } else {
-        eprintln!("[trade] disabled");
-        None
-    };
 
     let mut csv = open_csv(&config.csv_path)?;
     let mut stats_csv = open_stats_csv(&config.stats_csv_path)?;
@@ -464,7 +468,8 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             Some(update) = rx.recv() => {
-                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv, trade_client.clone(), &live_cfg).await?;
+                let tc = trade_client.read().await.clone();
+                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv, tc, &live_cfg).await?;
             }
             _ = dashboard_tick.tick() => {
                 let live = live_cfg.read().await.clone();
@@ -697,6 +702,56 @@ async fn logout_handler(
         state.sessions.write().await.remove(token);
     }
     StatusCode::OK
+}
+
+// ── API key management ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct KeysStatus {
+    active: bool,
+}
+
+#[derive(Deserialize)]
+struct KeysRequest {
+    mexc_api_key: String,
+    mexc_api_secret: String,
+}
+
+async fn keys_get(State(state): State<AppState>) -> Json<KeysStatus> {
+    let active = state.trade_client.read().await.is_some();
+    Json(KeysStatus { active })
+}
+
+async fn keys_post(
+    State(state): State<AppState>,
+    Json(req): Json<KeysRequest>,
+) -> StatusCode {
+    if let Err(e) = save_mexc_keys(&req.mexc_api_key, &req.mexc_api_secret) {
+        eprintln!("[keys] failed to save to telegram_config.json: {e:#}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    let mut client = state.trade_client.write().await;
+    if req.mexc_api_key.is_empty() || req.mexc_api_secret.is_empty() {
+        *client = None;
+        eprintln!("[trade] API keys cleared");
+    } else {
+        *client = Some(Arc::new(MexcTradeClient::new(req.mexc_api_key, req.mexc_api_secret, 1)));
+        eprintln!("[trade] API keys updated, client active");
+    }
+    StatusCode::OK
+}
+
+fn save_mexc_keys(api_key: &str, api_secret: &str) -> Result<()> {
+    const PATH: &str = "telegram_config.json";
+    let mut obj: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(PATH)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+    obj.insert("mexc_api_key".to_string(), serde_json::Value::String(api_key.to_string()));
+    obj.insert("mexc_api_secret".to_string(), serde_json::Value::String(api_secret.to_string()));
+    std::fs::write(PATH, serde_json::to_string_pretty(&obj)?)?;
+    Ok(())
 }
 
 // ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -1571,6 +1626,7 @@ async fn run_dashboard(state: AppState) {
     let protected = Router::new()
         .route("/api/state", get(dashboard_state))
         .route("/api/config", get(config_get).post(config_post))
+        .route("/api/keys", get(keys_get).post(keys_post))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     let app = Router::new()
@@ -1714,6 +1770,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <label>Trading: <input id="cfgTrade" type="checkbox"></label>
   <button onclick="saveConfig()">Apply</button>
   <span class="cfg-status" id="cfgStatus"></span>
+  <span style="color:#3a4558;margin:0 4px">|</span>
+  <label>API Key: <input id="cfgApiKey" type="password" placeholder="MEXC API key" style="width:160px"></label>
+  <label>Secret: <input id="cfgApiSecret" type="password" placeholder="MEXC secret" style="width:160px"></label>
+  <button onclick="saveKeys()">Set Keys</button>
+  <span class="cfg-status" id="keysStatus"></span>
 </div>
 <main>
   <section class="summary">
@@ -1789,6 +1850,39 @@ async function loadConfig() {
   document.getElementById('cfgConfirm').value = c.confirm_bps;
   document.getElementById('cfgAlert').value = c.alert_diff_bps;
   document.getElementById('cfgTrade').checked = c.trade_enabled;
+  loadKeys();
+}
+
+async function loadKeys() {
+  const r = await fetch('/api/keys', {headers: authH()}).catch(() => null);
+  if (!r || r.status === 401) return;
+  const d = await r.json();
+  const st = document.getElementById('keysStatus');
+  st.textContent = d.active ? 'Active ✓' : 'Not set';
+  st.style.color = d.active ? '#6dbf6d' : '#e0a060';
+}
+
+async function saveKeys() {
+  const key = document.getElementById('cfgApiKey').value.trim();
+  const secret = document.getElementById('cfgApiSecret').value.trim();
+  const st = document.getElementById('keysStatus');
+  st.textContent = '';
+  if (!key || !secret) { st.textContent = 'Enter both fields'; st.style.color = '#e06060'; return; }
+  const r = await fetch('/api/keys', {
+    method: 'POST',
+    headers: Object.assign({'Content-Type': 'application/json'}, authH()),
+    body: JSON.stringify({mexc_api_key: key, mexc_api_secret: secret})
+  }).catch(() => null);
+  if (!r || r.status === 401) { handle401(); return; }
+  if (r.ok) {
+    document.getElementById('cfgApiKey').value = '';
+    document.getElementById('cfgApiSecret').value = '';
+    st.textContent = 'Active ✓';
+    st.style.color = '#6dbf6d';
+  } else {
+    st.textContent = 'Error ✗';
+    st.style.color = '#e06060';
+  }
 }
 
 async function saveConfig() {
