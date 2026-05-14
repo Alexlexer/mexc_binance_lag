@@ -174,8 +174,6 @@ struct Config {
     alert_min_duration_ms: i64,
     #[serde(default = "default_max_quote_age_ms")]
     max_quote_age_ms: i64,
-    #[serde(default = "default_binance_idle_reconnect_ms")]
-    binance_idle_reconnect_ms: u64,
     #[serde(default)]
     mexc_api_key: String,
     #[serde(default)]
@@ -499,7 +497,6 @@ fn default_alert_diff_bps() -> Decimal { Decimal::new(5, 1) }
 fn default_alert_min_edge_bps() -> Decimal { Decimal::from(1) }
 fn default_alert_min_duration_ms() -> i64 { 500 }
 fn default_max_quote_age_ms() -> i64 { 2_000 }
-fn default_binance_idle_reconnect_ms() -> u64 { 10_000 }
 fn default_trade_vol() -> String { "1".to_string() }
 fn default_trade_leverage() -> i32 { 10 }
 fn default_trade_timeout_ms() -> u64 { 5000 }
