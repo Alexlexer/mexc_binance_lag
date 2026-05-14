@@ -101,6 +101,8 @@ struct AppState {
     users: Arc<Vec<User>>,
     login_attempts: SharedLoginAttempts,
     trade_client: SharedTradeClient,
+    slippage_csv_path: Arc<String>,
+    mexc_taker_fee_bps: Decimal,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -441,6 +443,8 @@ async fn main() -> Result<()> {
         users: Arc::new(users),
         login_attempts,
         trade_client: trade_client.clone(),
+        slippage_csv_path: Arc::new(config.slippage_csv_path.clone()),
+        mexc_taker_fee_bps: config.mexc_taker_fee_bps,
     };
 
     tokio::spawn(run_dashboard(app_state));
@@ -1596,6 +1600,7 @@ async fn run_dashboard(state: AppState) {
         .route("/api/state", get(dashboard_state))
         .route("/api/config", get(config_get).post(config_post))
         .route("/api/keys", get(keys_get).post(keys_post))
+        .route("/api/trade-stats", get(trade_stats_handler))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     let app = Router::new()
@@ -1629,6 +1634,60 @@ async fn config_get(State(state): State<AppState>) -> Json<LiveConfig> {
 async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConfig>) -> Json<LiveConfig> {
     *state.live_cfg.write().await = new_cfg.clone();
     Json(new_cfg)
+}
+
+#[derive(Serialize)]
+struct TradeStats {
+    trade_count: usize,
+    avg_gross_bps: Option<f64>,
+    avg_net_bps: Option<f64>,
+    fee_bps: f64,
+    expected_pnl_per_trade_usdt: Option<f64>,
+    notional_usdt: f64,
+}
+
+async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let path = state.slippage_csv_path.as_str();
+    let fee_bps = state.mexc_taker_fee_bps.to_string().parse::<f64>().unwrap_or(6.0);
+    let notional = state.live_cfg.read().await.trade_notional_usdt
+        .to_string().parse::<f64>().unwrap_or(300.0);
+
+    let gross_values: Vec<f64> = std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .skip(1) // header
+        .filter_map(|line| {
+            // CSV columns: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
+            //              entry_spread_bps,exit_spread_bps,gross_cross_bps,...
+            let cols: Vec<&str> = line.split(',').collect();
+            cols.get(10).and_then(|v| v.parse::<f64>().ok())
+        })
+        .collect();
+
+    let count = gross_values.len();
+    if count == 0 {
+        return Json(TradeStats {
+            trade_count: 0,
+            avg_gross_bps: None,
+            avg_net_bps: None,
+            fee_bps,
+            expected_pnl_per_trade_usdt: None,
+            notional_usdt: notional,
+        });
+    }
+
+    let avg_gross = gross_values.iter().sum::<f64>() / count as f64;
+    let avg_net = avg_gross - fee_bps * 2.0;
+    let expected_pnl = notional * avg_net / 10_000.0;
+
+    Json(TradeStats {
+        trade_count: count,
+        avg_gross_bps: Some((avg_gross * 1000.0).round() / 1000.0),
+        avg_net_bps: Some((avg_net * 1000.0).round() / 1000.0),
+        fee_bps,
+        expected_pnl_per_trade_usdt: Some((expected_pnl * 100.0).round() / 100.0),
+        notional_usdt: notional,
+    })
 }
 
 async fn dashboard_html() -> Html<&'static str> {
@@ -1758,6 +1817,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
+  <section class="summary" style="margin-top:16px" id="tradeStatsSection" hidden>
+    <div class="box">Сделок<b id="stTrades">-</b></div>
+    <div class="box">Avg gross bps<b id="stGross">-</b></div>
+    <div class="box">Avg net bps<b id="stNet">-</b></div>
+    <div class="box">E[PnL] / сделку<b id="stPnl">-</b></div>
+  </section>
 </main>
 <script>
 const TOKEN_KEY = 'dashboard_token';
@@ -1898,8 +1963,28 @@ async function refresh() {
     </tr>`).join('');
 }
 
-if (tok()) { loadConfig(); } else { showLogin(); }
+async function loadTradeStats() {
+  const r = await fetch('/api/trade-stats', {headers: authH()}).catch(() => null);
+  if (!r || r.status === 401) return;
+  const d = await r.json();
+  const sec = document.getElementById('tradeStatsSection');
+  if (d.trade_count === 0) { sec.hidden = true; return; }
+  sec.hidden = false;
+  document.getElementById('stTrades').textContent = d.trade_count;
+  document.getElementById('stGross').textContent = d.avg_gross_bps !== null ? d.avg_gross_bps.toFixed(3) : '-';
+  const net = d.avg_net_bps;
+  const netEl = document.getElementById('stNet');
+  netEl.textContent = net !== null ? net.toFixed(3) : '-';
+  netEl.style.color = net !== null ? (net > 0 ? '#6dbf6d' : '#e06060') : '';
+  const pnl = d.expected_pnl_per_trade_usdt;
+  const pnlEl = document.getElementById('stPnl');
+  pnlEl.textContent = pnl !== null ? `$${pnl.toFixed(2)}` : '-';
+  pnlEl.style.color = pnl !== null ? (pnl > 0 ? '#6dbf6d' : '#e06060') : '';
+}
+
+if (tok()) { loadConfig(); loadTradeStats(); } else { showLogin(); }
 setInterval(refresh, 1000);
+setInterval(loadTradeStats, 30000);
 refresh();
 </script>
 </body>
