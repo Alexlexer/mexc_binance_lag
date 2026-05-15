@@ -34,5 +34,5 @@
   "trade_notional_usdt": "100",
   "trade_timeout_ms": 5000,
   "trade_vol": "1",
-  "dashboard_bind": "0.0.0.0:8787"
+  "dashboard_bind": "127.0.0.1:8787"
 }
