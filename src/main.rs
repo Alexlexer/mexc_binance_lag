@@ -102,7 +102,6 @@ struct AppState {
     login_attempts: SharedLoginAttempts,
     trade_client: SharedTradeClient,
     slippage_csv_path: Arc<String>,
-    mexc_taker_fee_bps: Decimal,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -444,7 +443,6 @@ async fn main() -> Result<()> {
         login_attempts,
         trade_client: trade_client.clone(),
         slippage_csv_path: Arc::new(config.slippage_csv_path.clone()),
-        mexc_taker_fee_bps: config.mexc_taker_fee_bps,
     };
 
     tokio::spawn(run_dashboard(app_state));
@@ -1636,57 +1634,50 @@ async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConf
     Json(new_cfg)
 }
 
+// BTC/ETH/SOL have non-zero maker fees on MEXC futures; excluded from PnL simulation.
+const MAJOR_SYMBOLS: &[&str] = &["BTC_USDT", "ETH_USDT", "SOL_USDT"];
+
 #[derive(Serialize)]
 struct TradeStats {
     trade_count: usize,
     avg_gross_bps: Option<f64>,
-    avg_net_bps: Option<f64>,
-    fee_bps: f64,
-    expected_pnl_per_trade_usdt: Option<f64>,
-    notional_usdt: f64,
+    cumulative_pnl_usdt: f64,
+    winning_trades: usize,
 }
 
 async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // CSV columns: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
+    //              entry_spread_bps,exit_spread_bps,gross_cross_bps,fees_bps,net_cross_bps,estimated_pnl_usdt,...
     let path = state.slippage_csv_path.as_str();
-    let fee_bps = state.mexc_taker_fee_bps.to_string().parse::<f64>().unwrap_or(6.0);
-    let notional = state.live_cfg.read().await.trade_notional_usdt
-        .to_string().parse::<f64>().unwrap_or(300.0);
 
-    let gross_values: Vec<f64> = std::fs::read_to_string(path)
+    struct Row { gross: f64, pnl: f64 }
+    let rows: Vec<Row> = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
-        .skip(1) // header
+        .skip(1)
         .filter_map(|line| {
-            // CSV columns: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
-            //              entry_spread_bps,exit_spread_bps,gross_cross_bps,...
             let cols: Vec<&str> = line.split(',').collect();
-            cols.get(10).and_then(|v| v.parse::<f64>().ok())
+            if MAJOR_SYMBOLS.contains(cols.get(1)?) { return None; }
+            let gross = cols.get(10)?.parse::<f64>().ok()?;
+            let pnl = cols.get(13)?.parse::<f64>().ok()?;
+            Some(Row { gross, pnl })
         })
         .collect();
 
-    let count = gross_values.len();
+    let count = rows.len();
     if count == 0 {
-        return Json(TradeStats {
-            trade_count: 0,
-            avg_gross_bps: None,
-            avg_net_bps: None,
-            fee_bps,
-            expected_pnl_per_trade_usdt: None,
-            notional_usdt: notional,
-        });
+        return Json(TradeStats { trade_count: 0, avg_gross_bps: None, cumulative_pnl_usdt: 0.0, winning_trades: 0 });
     }
 
-    let avg_gross = gross_values.iter().sum::<f64>() / count as f64;
-    let avg_net = avg_gross - fee_bps * 2.0;
-    let expected_pnl = notional * avg_net / 10_000.0;
+    let avg_gross = rows.iter().map(|r| r.gross).sum::<f64>() / count as f64;
+    let cum_pnl: f64 = rows.iter().map(|r| r.pnl).sum();
+    let winning = rows.iter().filter(|r| r.pnl > 0.0).count();
 
     Json(TradeStats {
         trade_count: count,
         avg_gross_bps: Some((avg_gross * 1000.0).round() / 1000.0),
-        avg_net_bps: Some((avg_net * 1000.0).round() / 1000.0),
-        fee_bps,
-        expected_pnl_per_trade_usdt: Some((expected_pnl * 100.0).round() / 100.0),
-        notional_usdt: notional,
+        cumulative_pnl_usdt: (cum_pnl * 100.0).round() / 100.0,
+        winning_trades: winning,
     })
 }
 
@@ -1818,10 +1809,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     <tbody id="rows"></tbody>
   </table>
   <section class="summary" style="margin-top:16px" id="tradeStatsSection" hidden>
-    <div class="box">Сделок<b id="stTrades">-</b></div>
+    <div class="box">Altcoin сделок<b id="stTrades">-</b></div>
     <div class="box">Avg gross bps<b id="stGross">-</b></div>
-    <div class="box">Avg net bps<b id="stNet">-</b></div>
-    <div class="box">E[PnL] / сделку<b id="stPnl">-</b></div>
+    <div class="box">Cumulative PnL (sim)<b id="stCumPnl">-</b></div>
+    <div class="box">Win rate<b id="stWin">-</b></div>
   </section>
 </main>
 <script>
@@ -1971,15 +1962,13 @@ async function loadTradeStats() {
   if (d.trade_count === 0) { sec.hidden = true; return; }
   sec.hidden = false;
   document.getElementById('stTrades').textContent = d.trade_count;
-  document.getElementById('stGross').textContent = d.avg_gross_bps !== null ? d.avg_gross_bps.toFixed(3) : '-';
-  const net = d.avg_net_bps;
-  const netEl = document.getElementById('stNet');
-  netEl.textContent = net !== null ? net.toFixed(3) : '-';
-  netEl.style.color = net !== null ? (net > 0 ? '#6dbf6d' : '#e06060') : '';
-  const pnl = d.expected_pnl_per_trade_usdt;
-  const pnlEl = document.getElementById('stPnl');
-  pnlEl.textContent = pnl !== null ? `$${pnl.toFixed(2)}` : '-';
-  pnlEl.style.color = pnl !== null ? (pnl > 0 ? '#6dbf6d' : '#e06060') : '';
+  document.getElementById('stGross').textContent = d.avg_gross_bps !== null ? d.avg_gross_bps.toFixed(3) + ' bps' : '-';
+  const cum = d.cumulative_pnl_usdt;
+  const cumEl = document.getElementById('stCumPnl');
+  cumEl.textContent = `$${cum.toFixed(2)}`;
+  cumEl.style.color = cum > 0 ? '#6dbf6d' : '#e06060';
+  const winRate = d.trade_count > 0 ? Math.round(d.winning_trades / d.trade_count * 100) : 0;
+  document.getElementById('stWin').textContent = `${winRate}% (${d.winning_trades}/${d.trade_count})`;
 }
 
 if (tok()) { loadConfig(); loadTradeStats(); } else { showLogin(); }
