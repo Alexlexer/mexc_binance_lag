@@ -103,6 +103,7 @@ struct AppState {
     login_attempts: SharedLoginAttempts,
     trade_client: SharedTradeClient,
     slippage_csv_path: Arc<String>,
+    config_path: Arc<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -445,6 +446,7 @@ async fn main() -> Result<()> {
         login_attempts,
         trade_client: trade_client.clone(),
         slippage_csv_path: Arc::new(config.slippage_csv_path.clone()),
+        config_path: Arc::new("config.json".to_string()),
     };
 
     tokio::spawn(run_dashboard(app_state));
@@ -1632,8 +1634,22 @@ async fn config_get(State(state): State<AppState>) -> Json<LiveConfig> {
     Json(state.live_cfg.read().await.clone())
 }
 
-async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConfig>) -> Json<LiveConfig> {
+async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConfig>) -> impl IntoResponse {
     *state.live_cfg.write().await = new_cfg.clone();
+    // Persist live fields back into config.json so they survive restart.
+    if let Ok(text) = std::fs::read_to_string(state.config_path.as_str()) {
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
+            json["impulse_bps"] = new_cfg.impulse_bps.to_string().into();
+            json["confirm_bps"] = new_cfg.confirm_bps.to_string().into();
+            json["alert_diff_bps"] = new_cfg.alert_diff_bps.to_string().into();
+            json["trade_notional_usdt"] = new_cfg.trade_margin_usdt.to_string().into();
+            json["trade_leverage"] = new_cfg.trade_leverage.into();
+            json["trade_enabled"] = new_cfg.trade_enabled.into();
+            if let Ok(out) = serde_json::to_string_pretty(&json) {
+                let _ = std::fs::write(state.config_path.as_str(), out);
+            }
+        }
+    }
     Json(new_cfg)
 }
 
