@@ -87,6 +87,7 @@ struct LiveConfig {
     impulse_bps: Decimal,
     confirm_bps: Decimal,
     alert_diff_bps: Decimal,
+    max_lag_ms: i64,
     trade_margin_usdt: Decimal,
     trade_leverage: i32,
     trade_enabled: bool,
@@ -421,6 +422,7 @@ async fn main() -> Result<()> {
         impulse_bps: config.impulse_bps,
         confirm_bps: config.confirm_bps,
         alert_diff_bps: config.alert_diff_bps,
+        max_lag_ms: config.max_lag_ms,
         trade_margin_usdt: config.trade_notional_usdt,
         trade_leverage: config.trade_leverage,
         trade_enabled: config.trade_enabled,
@@ -482,10 +484,10 @@ async fn main() -> Result<()> {
             }
             _ = stats_tick.tick() => {
                 let live = live_cfg.read().await.clone();
-                expire_old_pending(&config, &mut states, &mut stats);
+                expire_old_pending(&config, &live, &mut states, &mut stats);
                 let snapshot = build_dashboard_snapshot(&config, &live, &states, &stats);
                 *dashboard.write().await = snapshot;
-                print_stats(&config, &states, &stats);
+                print_stats(&config, &live, &states, &stats);
                 write_stats_snapshot(&mut stats_csv, &config, &states, &stats)?;
             }
         }
@@ -864,7 +866,7 @@ async fn handle_quote(
             'detect: {
                 let Some(pending) = state.pending.clone() else { break 'detect; };
 
-                if now - pending.created_recv_ts_ms > config.max_lag_ms {
+                if now - pending.created_recv_ts_ms > live.max_lag_ms {
                     state.pending = None;
                     stats.record_expired(&pending.symbol);
                     break 'detect;
@@ -1106,11 +1108,11 @@ fn send_telegram_to_subscribers(config: &Config, text: &str) {
     });
 }
 
-fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
+fn expire_old_pending(_config: &Config, live: &LiveConfig, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
     let now = now_ms();
     for (symbol, state) in states.iter_mut() {
         if let Some(pending) = &state.pending {
-            if now - pending.created_recv_ts_ms > config.max_lag_ms {
+            if now - pending.created_recv_ts_ms > live.max_lag_ms {
                 let expired_symbol = symbol.clone();
                 state.pending = None;
                 stats.record_expired(&expired_symbol);
@@ -1119,14 +1121,14 @@ fn expire_old_pending(config: &Config, states: &mut HashMap<String, SymbolState>
     }
 }
 
-fn print_stats(config: &Config, states: &HashMap<String, SymbolState>, stats: &Stats) {
+fn print_stats(config: &Config, live: &LiveConfig, states: &HashMap<String, SymbolState>, stats: &Stats) {
     let mut stdout = io::stdout();
     let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
     println!("=== MEXC LAG MONITOR {} | symbols={} ===", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"), config.symbols.len());
     println!("{}", stats.summary());
     println!(
         "thresholds: impulse>={}bps confirm>={}bps max_lag={}ms window={}ms",
-        config.impulse_bps, config.confirm_bps, config.max_lag_ms, config.impulse_window_ms
+        live.impulse_bps, live.confirm_bps, live.max_lag_ms, config.impulse_window_ms
     );
     println!(
         "{:<12} {:>8} {:>8} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>12} {:>12} {:>8}",
@@ -1591,7 +1593,7 @@ fn build_dashboard_snapshot(
         summary: stats.summary(),
         impulse_bps: live.impulse_bps.to_string(),
         confirm_bps: live.confirm_bps.to_string(),
-        max_lag_ms: config.max_lag_ms,
+        max_lag_ms: live.max_lag_ms,
         symbols,
     }
 }
@@ -1641,6 +1643,7 @@ async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConf
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
             json["impulse_bps"] = new_cfg.impulse_bps.to_string().into();
             json["confirm_bps"] = new_cfg.confirm_bps.to_string().into();
+            json["max_lag_ms"] = new_cfg.max_lag_ms.into();
             json["alert_diff_bps"] = new_cfg.alert_diff_bps.to_string().into();
             json["trade_notional_usdt"] = new_cfg.trade_margin_usdt.to_string().into();
             json["trade_leverage"] = new_cfg.trade_leverage.into();
@@ -1846,6 +1849,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <label>Leverage: <input id="cfgLeverage" type="number" min="1" max="200" step="1"></label>
   <label>Impulse (bps): <input id="cfgImpulse" type="number" min="0.1" step="0.1"></label>
   <label>Confirm (bps): <input id="cfgConfirm" type="number" min="0.1" step="0.1"></label>
+  <label>Max lag (ms): <input id="cfgMaxLag" type="number" min="100" step="100"></label>
   <label>Alert diff (bps): <input id="cfgAlert" type="number" min="0.1" step="0.1"></label>
   <label>Trading: <input id="cfgTrade" type="checkbox"></label>
   <button onclick="saveConfig()">Apply</button>
@@ -1937,6 +1941,7 @@ async function loadConfig() {
   document.getElementById('cfgLeverage').value = c.trade_leverage;
   document.getElementById('cfgImpulse').value = c.impulse_bps;
   document.getElementById('cfgConfirm').value = c.confirm_bps;
+  document.getElementById('cfgMaxLag').value = c.max_lag_ms;
   document.getElementById('cfgAlert').value = c.alert_diff_bps;
   document.getElementById('cfgTrade').checked = c.trade_enabled;
   loadKeys();
@@ -1980,6 +1985,7 @@ async function saveConfig() {
     trade_leverage: parseInt(document.getElementById('cfgLeverage').value),
     impulse_bps: parseFloat(document.getElementById('cfgImpulse').value),
     confirm_bps: parseFloat(document.getElementById('cfgConfirm').value),
+    max_lag_ms: parseInt(document.getElementById('cfgMaxLag').value),
     alert_diff_bps: parseFloat(document.getElementById('cfgAlert').value),
     trade_enabled: document.getElementById('cfgTrade').checked,
   };
