@@ -6,7 +6,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::{Request, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Response},
@@ -1640,46 +1640,73 @@ const MAJOR_SYMBOLS: &[&str] = &["BTC_USDT", "ETH_USDT", "SOL_USDT"];
 #[derive(Serialize)]
 struct TradeStats {
     total_detected: usize,
-    trade_count: usize,       // events with gross > fee (actually tradeable)
+    trade_count: usize,
     avg_gross_bps: Option<f64>,
     avg_net_bps: Option<f64>,
     cumulative_pnl_usdt: f64,
     fee_bps: f64,
+    min_lag_ms: i64,
 }
 
-async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // CSV columns: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
-    //              entry_spread_bps,exit_spread_bps,gross_cross_bps,...
-    // Only altcoins: taker entry (6 bps) + maker exit (0 bps) = 6 bps total fee.
+#[derive(Deserialize, Default)]
+struct TradeStatsQuery {
+    min_lag_ms: Option<i64>,
+}
+
+async fn trade_stats_handler(
+    State(state): State<AppState>,
+    Query(query): Query<TradeStatsQuery>,
+) -> impl IntoResponse {
+    // CSV: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
+    //      entry_spread_bps,exit_spread_bps,gross_cross_bps,...
+    //
+    // Two filters for realism:
+    // 1. lag_ms >= min_lag_ms: events where MEXC lagged long enough for your order to execute.
+    //    If MEXC moves in 150ms but your order takes 150ms, you arrive after MEXC already moved.
+    // 2. gross > fee: only count events that are actually profitable after 6 bps taker fee.
     const ALTCOIN_FEE_BPS: f64 = 6.0;
+    let min_lag_ms = query.min_lag_ms.unwrap_or(200);
     let path = state.slippage_csv_path.as_str();
     let notional = state.live_cfg.read().await.trade_notional_usdt
         .to_string().parse::<f64>().unwrap_or(300.0);
 
-    let all_gross: Vec<f64> = std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let cols: Vec<&str> = line.split(',').collect();
-            if MAJOR_SYMBOLS.contains(cols.get(1)?) { return None; }
-            cols.get(10)?.parse::<f64>().ok()
-        })
-        .collect();
+    struct Row { gross: f64 }
+    let (total, rows): (usize, Vec<Row>) = {
+        let mut total = 0usize;
+        let rows = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let cols: Vec<&str> = line.split(',').collect();
+                if MAJOR_SYMBOLS.contains(cols.get(1)?) { return None; }
+                let lag: i64 = cols.get(3)?.parse().ok()?;
+                let gross: f64 = cols.get(10)?.parse().ok()?;
+                total += 1;
+                if lag >= min_lag_ms && gross > ALTCOIN_FEE_BPS { Some(Row { gross }) } else { None }
+            })
+            .collect();
+        // total counts all altcoin rows regardless of filters
+        let all_total = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                let cols: Vec<&str> = line.split(',').collect();
+                cols.get(1).map(|s| !MAJOR_SYMBOLS.contains(s)).unwrap_or(false)
+            })
+            .count();
+        (all_total, rows)
+    };
 
-    let total = all_gross.len();
-
-    // Only count events where gross > fee — these are the ones worth trading.
-    let tradeable: Vec<f64> = all_gross.into_iter().filter(|&g| g > ALTCOIN_FEE_BPS).collect();
-    let count = tradeable.len();
-
+    let count = rows.len();
     if count == 0 {
-        return Json(TradeStats { total_detected: total, trade_count: 0, avg_gross_bps: None, avg_net_bps: None, cumulative_pnl_usdt: 0.0, fee_bps: ALTCOIN_FEE_BPS });
+        return Json(TradeStats { total_detected: total, trade_count: 0, avg_gross_bps: None, avg_net_bps: None, cumulative_pnl_usdt: 0.0, fee_bps: ALTCOIN_FEE_BPS, min_lag_ms });
     }
 
-    let avg_gross = tradeable.iter().sum::<f64>() / count as f64;
+    let avg_gross = rows.iter().map(|r| r.gross).sum::<f64>() / count as f64;
     let avg_net = avg_gross - ALTCOIN_FEE_BPS;
-    let cum_pnl: f64 = tradeable.iter().map(|&g| notional * (g - ALTCOIN_FEE_BPS) / 10_000.0).sum();
+    let cum_pnl: f64 = rows.iter().map(|r| notional * (r.gross - ALTCOIN_FEE_BPS) / 10_000.0).sum();
 
     Json(TradeStats {
         total_detected: total,
@@ -1688,6 +1715,7 @@ async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse
         avg_net_bps: Some((avg_net * 1000.0).round() / 1000.0),
         cumulative_pnl_usdt: (cum_pnl * 100.0).round() / 100.0,
         fee_bps: ALTCOIN_FEE_BPS,
+        min_lag_ms,
     })
 }
 
@@ -1819,8 +1847,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     <tbody id="rows"></tbody>
   </table>
   <section class="summary" style="margin-top:16px" id="tradeStatsSection" hidden>
-    <div class="box">Обнаружено событий<b id="stTotal">-</b></div>
-    <div class="box">Сделок (gross&gt;fee)<b id="stTrades">-</b></div>
+    <div class="box">Событий (altcoin)<b id="stTotal">-</b></div>
+    <div class="box">Tradeable (lag≥<input id="minLagInput" type="number" value="200" min="0" step="50" style="width:52px;background:#1a2030;color:#c8d0e0;border:1px solid #2a3550;border-radius:3px;padding:1px 3px" onchange="loadTradeStats()">ms, gross&gt;6bps)<b id="stTrades">-</b></div>
     <div class="box">Avg net bps<b id="stNet">-</b></div>
     <div class="box">Cumulative PnL (sim)<b id="stCumPnl">-</b></div>
   </section>
@@ -1965,7 +1993,8 @@ async function refresh() {
 }
 
 async function loadTradeStats() {
-  const r = await fetch('/api/trade-stats', {headers: authH()}).catch(() => null);
+  const minLag = document.getElementById('minLagInput')?.value || 200;
+  const r = await fetch(`/api/trade-stats?min_lag_ms=${minLag}`, {headers: authH()}).catch(() => null);
   if (!r || r.status === 401) return;
   const d = await r.json();
   const sec = document.getElementById('tradeStatsSection');
@@ -1976,11 +2005,11 @@ async function loadTradeStats() {
   document.getElementById('stTrades').textContent = `${d.trade_count} (${pct}%)`;
   const net = d.avg_net_bps;
   const netEl = document.getElementById('stNet');
-  netEl.textContent = net !== null ? net.toFixed(3) + ' bps' : '-';
-  netEl.style.color = net !== null ? (net > 0 ? '#6dbf6d' : '#e06060') : '';
+  netEl.textContent = net !== null ? net.toFixed(3) + ' bps' : 'нет данных';
+  netEl.style.color = net !== null ? (net > 0 ? '#6dbf6d' : '#e06060') : '#888';
   const cum = d.cumulative_pnl_usdt;
   const cumEl = document.getElementById('stCumPnl');
-  cumEl.textContent = cum !== null ? `$${cum.toFixed(2)}` : '-';
+  cumEl.textContent = d.trade_count > 0 ? `$${cum.toFixed(2)}` : '-';
   cumEl.style.color = cum > 0 ? '#6dbf6d' : '#e06060';
 }
 
