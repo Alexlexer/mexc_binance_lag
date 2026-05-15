@@ -417,6 +417,9 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--add-user") {
         return add_user_interactive();
     }
+    if args.iter().any(|a| a == "--add-user-env") {
+        return add_user_from_env();
+    }
 
     tracing_subscriber::fmt()
         .with_ansi(false)
@@ -658,6 +661,42 @@ fn add_user_interactive() -> Result<()> {
         hash,
     });
     std::fs::write(USERS_PATH, serde_json::to_string_pretty(&users)?)?;
+    println!("User '{}' saved.", username);
+    Ok(())
+}
+
+fn add_user_from_env() -> Result<()> {
+    const USERS_PATH: &str = "users.json";
+    let username = std::env::var("LAGMON_ADMIN_USERNAME")
+        .context("LAGMON_ADMIN_USERNAME is required")?
+        .trim()
+        .to_string();
+    let password =
+        std::env::var("LAGMON_ADMIN_PASSWORD").context("LAGMON_ADMIN_PASSWORD is required")?;
+    anyhow::ensure!(!username.is_empty(), "username cannot be empty");
+    anyhow::ensure!(!password.is_empty(), "password cannot be empty");
+
+    let mut users: Vec<User> = if std::path::Path::new(USERS_PATH).exists() {
+        let text = std::fs::read_to_string(USERS_PATH)?;
+        serde_json::from_str(&text).context("parse users.json")?
+    } else {
+        Vec::new()
+    };
+    let hash = hash_password(&password)?;
+    users.retain(|u| u.username != username);
+    users.push(User {
+        username: username.clone(),
+        hash,
+    });
+    let text = serde_json::to_string_pretty(&users)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(USERS_PATH)?;
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    restrict_owner_only(USERS_PATH)?;
     println!("User '{}' saved.", username);
     Ok(())
 }
