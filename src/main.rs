@@ -87,7 +87,8 @@ struct LiveConfig {
     impulse_bps: Decimal,
     confirm_bps: Decimal,
     alert_diff_bps: Decimal,
-    trade_notional_usdt: Decimal,
+    trade_margin_usdt: Decimal,
+    trade_leverage: i32,
     trade_enabled: bool,
 }
 
@@ -419,7 +420,8 @@ async fn main() -> Result<()> {
         impulse_bps: config.impulse_bps,
         confirm_bps: config.confirm_bps,
         alert_diff_bps: config.alert_diff_bps,
-        trade_notional_usdt: config.trade_notional_usdt,
+        trade_margin_usdt: config.trade_notional_usdt,
+        trade_leverage: config.trade_leverage,
         trade_enabled: config.trade_enabled,
     }));
     let dashboard = Arc::new(RwLock::new(DashboardSnapshot::default()));
@@ -928,7 +930,7 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
     let diff_usdt = m_mid - b_mid;
     let diff_bps = diff_usdt / b_mid * Decimal::from(10_000);
     let abs_diff_bps = diff_bps.abs();
-    let edge = estimate_diff_edge(binance, mexc, diff_bps, live.trade_notional_usdt);
+    let edge = estimate_diff_edge(binance, mexc, diff_bps, live.trade_margin_usdt * Decimal::from(live.trade_leverage));
     let now = now_ms();
     let binance_age_ms = now - binance.recv_ts_ms;
     let mexc_age_ms = now - mexc.recv_ts_ms;
@@ -1001,7 +1003,7 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
                                 m_mid,
                                 b_mid,
                                 config.trade_vol.clone(),
-                                config.trade_leverage,
+                                live.trade_leverage,
                                 config.trade_timeout_ms,
                                 close_rx,
                             ));
@@ -1272,8 +1274,9 @@ fn write_slippage_record(
 
     let fees_bps = config.mexc_taker_fee_bps * Decimal::from(2);
     let net_cross_bps = gross_cross_bps - fees_bps;
-    let estimated_pnl_usdt = live.trade_notional_usdt * net_cross_bps / Decimal::from(10_000);
-    let pnl_zero_fee_usdt = live.trade_notional_usdt * gross_cross_bps / Decimal::from(10_000);
+    let position_usdt = live.trade_margin_usdt * Decimal::from(live.trade_leverage);
+    let estimated_pnl_usdt = position_usdt * net_cross_bps / Decimal::from(10_000);
+    let pnl_zero_fee_usdt = position_usdt * gross_cross_bps / Decimal::from(10_000);
 
     writeln!(
         file,
@@ -1667,8 +1670,11 @@ async fn trade_stats_handler(
     const ALTCOIN_FEE_BPS: f64 = 6.0;
     let min_lag_ms = query.min_lag_ms.unwrap_or(200);
     let path = state.slippage_csv_path.as_str();
-    let notional = state.live_cfg.read().await.trade_notional_usdt
-        .to_string().parse::<f64>().unwrap_or(300.0);
+    let live = state.live_cfg.read().await;
+    let margin = live.trade_margin_usdt.to_string().parse::<f64>().unwrap_or(300.0);
+    let leverage = live.trade_leverage as f64;
+    let notional = margin * leverage;
+    drop(live);
 
     struct Row { gross: f64 }
     let (total, rows): (usize, Vec<Row>) = {
@@ -1820,7 +1826,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <button class="btn-logout" onclick="doLogout()">Выйти</button>
 </header>
 <div class="settings">
-  <label>Notional (USDT): <input id="cfgNotional" type="number" min="1" step="10"></label>
+  <label>Margin (USDT): <input id="cfgMargin" type="number" min="1" step="10"></label>
+  <label>Leverage: <input id="cfgLeverage" type="number" min="1" max="200" step="1"></label>
   <label>Impulse (bps): <input id="cfgImpulse" type="number" min="0.1" step="0.1"></label>
   <label>Confirm (bps): <input id="cfgConfirm" type="number" min="0.1" step="0.1"></label>
   <label>Alert diff (bps): <input id="cfgAlert" type="number" min="0.1" step="0.1"></label>
@@ -1910,7 +1917,8 @@ async function loadConfig() {
   const r = await fetch('/api/config', {headers: authH()}).catch(() => null);
   if (!r || r.status === 401) { handle401(); return; }
   const c = await r.json();
-  document.getElementById('cfgNotional').value = c.trade_notional_usdt;
+  document.getElementById('cfgMargin').value = c.trade_margin_usdt;
+  document.getElementById('cfgLeverage').value = c.trade_leverage;
   document.getElementById('cfgImpulse').value = c.impulse_bps;
   document.getElementById('cfgConfirm').value = c.confirm_bps;
   document.getElementById('cfgAlert').value = c.alert_diff_bps;
@@ -1952,7 +1960,8 @@ async function saveKeys() {
 
 async function saveConfig() {
   const body = {
-    trade_notional_usdt: parseFloat(document.getElementById('cfgNotional').value),
+    trade_margin_usdt: parseFloat(document.getElementById('cfgMargin').value),
+    trade_leverage: parseInt(document.getElementById('cfgLeverage').value),
     impulse_bps: parseFloat(document.getElementById('cfgImpulse').value),
     confirm_bps: parseFloat(document.getElementById('cfgConfirm').value),
     alert_diff_bps: parseFloat(document.getElementById('cfgAlert').value),
