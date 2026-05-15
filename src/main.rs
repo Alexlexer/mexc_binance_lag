@@ -29,7 +29,7 @@ use mexc_trade::MexcTradeClient;
 use rand::{distributions::Alphanumeric, Rng};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -1620,11 +1620,12 @@ async fn run_mexc(config: Config, tx: mpsc::Sender<QuoteUpdate>) {
 async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result<()> {
     let (ws, _) = connect_async(config.mexc_ws.as_str()).await?;
     let (mut write, mut read) = ws.split();
+    let mut books = load_mexc_books(config).await;
 
     for symbol in &config.symbols {
         let sub = serde_json::json!({
-            "method": "sub.depth.full",
-            "param": { "symbol": symbol, "limit": 5 }
+            "method": "sub.depth",
+            "param": { "symbol": symbol, "compress": false }
         });
         write.send(Message::Text(sub.to_string())).await?;
     }
@@ -1640,7 +1641,7 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
                 let Some(msg) = msg else { break; };
                 let msg = msg?;
                 if let Message::Text(text) = msg {
-                    if let Some(update) = parse_mexc_depth(&text) {
+                    if let Some(update) = parse_mexc_depth_update(&text, &mut books) {
                         if send_quote(tx, update).is_err() {
                             break;
                         }
@@ -1650,6 +1651,81 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct MexcBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    version: Option<i64>,
+}
+
+impl MexcBook {
+    fn apply(&mut self, data: &MexcDepthData) {
+        apply_mexc_levels(&mut self.bids, &data.bids);
+        apply_mexc_levels(&mut self.asks, &data.asks);
+        if let Some(version) = data.version {
+            self.version = Some(version);
+        }
+    }
+
+    fn best_bid(&self) -> Option<Decimal> {
+        self.bids.keys().next_back().copied()
+    }
+
+    fn best_ask(&self) -> Option<Decimal> {
+        self.asks.keys().next().copied()
+    }
+}
+
+fn apply_mexc_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[Vec<Decimal>]) {
+    for level in levels {
+        let Some(price) = level.first().copied() else {
+            continue;
+        };
+        let amount = level.get(1).copied().unwrap_or(Decimal::ZERO);
+        if price <= Decimal::ZERO {
+            continue;
+        }
+        if amount <= Decimal::ZERO {
+            side.remove(&price);
+        } else {
+            side.insert(price, amount);
+        }
+    }
+}
+
+async fn load_mexc_books(config: &Config) -> HashMap<String, MexcBook> {
+    let client = reqwest::Client::new();
+    let mut books = HashMap::new();
+    for symbol in &config.symbols {
+        match fetch_mexc_book(&client, symbol).await {
+            Ok(book) => {
+                books.insert(symbol.clone(), book);
+            }
+            Err(e) => {
+                eprintln!("[mexc] snapshot error {symbol}: {e:#}");
+                books.insert(symbol.clone(), MexcBook::default());
+            }
+        }
+    }
+    books
+}
+
+async fn fetch_mexc_book(client: &reqwest::Client, symbol: &str) -> Result<MexcBook> {
+    let url = format!("https://contract.mexc.com/api/v1/contract/depth/{symbol}?limit=20");
+    let value: serde_json::Value = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let data_value = value.get("data").cloned().unwrap_or(value);
+    let data: MexcDepthData = serde_json::from_value(data_value)?;
+    let mut book = MexcBook::default();
+    book.apply(&data);
+    Ok(book)
 }
 
 fn send_quote(
@@ -1721,42 +1797,40 @@ struct MexcDepthMsg {
 struct MexcDepthData {
     bids: Vec<Vec<Decimal>>,
     asks: Vec<Vec<Decimal>>,
+    version: Option<i64>,
 }
 
-fn parse_mexc_depth(text: &str) -> Option<QuoteUpdate> {
+fn parse_mexc_depth_update(
+    text: &str,
+    books: &mut HashMap<String, MexcBook>,
+) -> Option<QuoteUpdate> {
     let msg: MexcDepthMsg = serde_json::from_str(text).ok()?;
     if msg.channel.as_deref() != Some("push.depth.full")
         && msg.channel.as_deref() != Some("push.depth")
     {
         return None;
     }
+    let symbol = msg.symbol?;
     let data = msg.data?;
-    let best_bid = best_price(&data.bids, true)?;
-    let best_ask = best_price(&data.asks, false)?;
+    let book = books.entry(symbol.clone()).or_default();
+    if let (Some(current), Some(next)) = (book.version, data.version) {
+        if next <= current {
+            return None;
+        }
+    }
+    book.apply(&data);
+    let best_bid = book.best_bid()?;
+    let best_ask = book.best_ask()?;
     if best_bid <= Decimal::ZERO || best_ask <= Decimal::ZERO || best_bid >= best_ask {
         return None;
     }
     Some(QuoteUpdate {
         exchange: Exchange::Mexc,
-        symbol: msg.symbol?,
+        symbol,
         bid: best_bid,
         ask: best_ask,
         recv_ts_ms: now_ms(),
     })
-}
-
-fn best_price(levels: &[Vec<Decimal>], is_bid: bool) -> Option<Decimal> {
-    levels
-        .iter()
-        .filter_map(|level| level.first().copied())
-        .filter(|p| *p > Decimal::ZERO)
-        .reduce(|best, price| {
-            if is_bid {
-                best.max(price)
-            } else {
-                best.min(price)
-            }
-        })
 }
 
 fn normalize_binance_symbol(symbol: &str) -> String {
