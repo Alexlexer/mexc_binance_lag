@@ -1639,23 +1639,24 @@ const MAJOR_SYMBOLS: &[&str] = &["BTC_USDT", "ETH_USDT", "SOL_USDT"];
 
 #[derive(Serialize)]
 struct TradeStats {
-    trade_count: usize,
+    total_detected: usize,
+    trade_count: usize,       // events with gross > fee (actually tradeable)
     avg_gross_bps: Option<f64>,
+    avg_net_bps: Option<f64>,
     cumulative_pnl_usdt: f64,
-    winning_trades: usize,
+    fee_bps: f64,
 }
 
 async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     // CSV columns: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
     //              entry_spread_bps,exit_spread_bps,gross_cross_bps,...
-    // Recompute PnL from gross_cross_bps with correct 6 bps fee (taker entry + 0 maker exit).
-    // The pre-baked estimated_pnl_usdt column uses 12 bps (both taker) which is wrong for altcoins.
+    // Only altcoins: taker entry (6 bps) + maker exit (0 bps) = 6 bps total fee.
     const ALTCOIN_FEE_BPS: f64 = 6.0;
     let path = state.slippage_csv_path.as_str();
     let notional = state.live_cfg.read().await.trade_notional_usdt
         .to_string().parse::<f64>().unwrap_or(300.0);
 
-    let gross_values: Vec<f64> = std::fs::read_to_string(path)
+    let all_gross: Vec<f64> = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .skip(1)
@@ -1666,22 +1667,27 @@ async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse
         })
         .collect();
 
-    let count = gross_values.len();
+    let total = all_gross.len();
+
+    // Only count events where gross > fee — these are the ones worth trading.
+    let tradeable: Vec<f64> = all_gross.into_iter().filter(|&g| g > ALTCOIN_FEE_BPS).collect();
+    let count = tradeable.len();
+
     if count == 0 {
-        return Json(TradeStats { trade_count: 0, avg_gross_bps: None, cumulative_pnl_usdt: 0.0, winning_trades: 0 });
+        return Json(TradeStats { total_detected: total, trade_count: 0, avg_gross_bps: None, avg_net_bps: None, cumulative_pnl_usdt: 0.0, fee_bps: ALTCOIN_FEE_BPS });
     }
 
-    let avg_gross = gross_values.iter().sum::<f64>() / count as f64;
-    let cum_pnl: f64 = gross_values.iter()
-        .map(|&g| notional * (g - ALTCOIN_FEE_BPS) / 10_000.0)
-        .sum();
-    let winning = gross_values.iter().filter(|&&g| g > ALTCOIN_FEE_BPS).count();
+    let avg_gross = tradeable.iter().sum::<f64>() / count as f64;
+    let avg_net = avg_gross - ALTCOIN_FEE_BPS;
+    let cum_pnl: f64 = tradeable.iter().map(|&g| notional * (g - ALTCOIN_FEE_BPS) / 10_000.0).sum();
 
     Json(TradeStats {
+        total_detected: total,
         trade_count: count,
         avg_gross_bps: Some((avg_gross * 1000.0).round() / 1000.0),
+        avg_net_bps: Some((avg_net * 1000.0).round() / 1000.0),
         cumulative_pnl_usdt: (cum_pnl * 100.0).round() / 100.0,
-        winning_trades: winning,
+        fee_bps: ALTCOIN_FEE_BPS,
     })
 }
 
@@ -1813,10 +1819,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     <tbody id="rows"></tbody>
   </table>
   <section class="summary" style="margin-top:16px" id="tradeStatsSection" hidden>
-    <div class="box">Altcoin сделок<b id="stTrades">-</b></div>
-    <div class="box">Avg gross bps<b id="stGross">-</b></div>
+    <div class="box">Обнаружено событий<b id="stTotal">-</b></div>
+    <div class="box">Сделок (gross&gt;fee)<b id="stTrades">-</b></div>
+    <div class="box">Avg net bps<b id="stNet">-</b></div>
     <div class="box">Cumulative PnL (sim)<b id="stCumPnl">-</b></div>
-    <div class="box">Win rate<b id="stWin">-</b></div>
   </section>
 </main>
 <script>
@@ -1963,16 +1969,19 @@ async function loadTradeStats() {
   if (!r || r.status === 401) return;
   const d = await r.json();
   const sec = document.getElementById('tradeStatsSection');
-  if (d.trade_count === 0) { sec.hidden = true; return; }
+  if (d.total_detected === 0) { sec.hidden = true; return; }
   sec.hidden = false;
-  document.getElementById('stTrades').textContent = d.trade_count;
-  document.getElementById('stGross').textContent = d.avg_gross_bps !== null ? d.avg_gross_bps.toFixed(3) + ' bps' : '-';
+  document.getElementById('stTotal').textContent = d.total_detected;
+  const pct = d.total_detected > 0 ? Math.round(d.trade_count / d.total_detected * 100) : 0;
+  document.getElementById('stTrades').textContent = `${d.trade_count} (${pct}%)`;
+  const net = d.avg_net_bps;
+  const netEl = document.getElementById('stNet');
+  netEl.textContent = net !== null ? net.toFixed(3) + ' bps' : '-';
+  netEl.style.color = net !== null ? (net > 0 ? '#6dbf6d' : '#e06060') : '';
   const cum = d.cumulative_pnl_usdt;
   const cumEl = document.getElementById('stCumPnl');
-  cumEl.textContent = `$${cum.toFixed(2)}`;
+  cumEl.textContent = cum !== null ? `$${cum.toFixed(2)}` : '-';
   cumEl.style.color = cum > 0 ? '#6dbf6d' : '#e06060';
-  const winRate = d.trade_count > 0 ? Math.round(d.winning_trades / d.trade_count * 100) : 0;
-  document.getElementById('stWin').textContent = `${winRate}% (${d.winning_trades}/${d.trade_count})`;
 }
 
 if (tok()) { loadConfig(); loadTradeStats(); } else { showLogin(); }
