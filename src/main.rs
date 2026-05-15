@@ -1,5 +1,4 @@
 mod mexc_trade;
-use mexc_trade::MexcTradeClient;
 use anyhow::{Context, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -13,25 +12,28 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
 use chrono::Utc;
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
 use futures_util::{SinkExt, StreamExt};
+use mexc_trade::MexcTradeClient;
 use rand::{distributions::Alphanumeric, Rng};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tower_http::cors::CorsLayer;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-
+use tower_http::cors::CorsLayer;
 
 static TELEGRAM_BLOCKED_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -241,7 +243,6 @@ struct LagRecord {
     mexc_recv_ts_ms: i64,
 }
 
-
 #[derive(Debug, Clone)]
 struct ActiveDiffAlert {
     started_ms: i64,
@@ -412,7 +413,9 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("warn".parse()?))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("warn".parse()?),
+        )
         .init();
 
     let config = load_config()?;
@@ -433,7 +436,11 @@ async fn main() -> Result<()> {
 
     let initial_client: Option<Arc<MexcTradeClient>> = if !config.mexc_api_key.is_empty() {
         eprintln!("[trade] API keys loaded, client active");
-        Some(Arc::new(MexcTradeClient::new(config.mexc_api_key.clone(), config.mexc_api_secret.clone(), 1)))
+        Some(Arc::new(MexcTradeClient::new(
+            config.mexc_api_key.clone(),
+            config.mexc_api_secret.clone(),
+            1,
+        )))
     } else {
         eprintln!("[trade] no API keys — set them in the dashboard");
         None
@@ -474,8 +481,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             Some(update) = rx.recv() => {
-                let tc = trade_client.read().await.clone();
-                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv, tc, &live_cfg).await?;
+                handle_quote(update, &config, &mut states, &mut stats, &mut csv, &mut slippage_csv, &trade_client, &live_cfg).await?;
             }
             _ = dashboard_tick.tick() => {
                 let live = live_cfg.read().await.clone();
@@ -496,18 +502,42 @@ async fn main() -> Result<()> {
 
 // ── Config defaults ───────────────────────────────────────────────────────────
 
-fn default_stats_csv_path() -> String { "stats_snapshots.csv".to_string() }
-fn default_slippage_csv_path() -> String { "slippage_events.csv".to_string() }
-fn default_mexc_taker_fee_bps() -> Decimal { Decimal::from(6) }
-fn default_trade_notional_usdt() -> Decimal { Decimal::from(300) }
-fn default_telegram_subscribers_path() -> String { "telegram_subscribers.json".to_string() }
-fn default_alert_diff_bps() -> Decimal { Decimal::new(5, 1) }
-fn default_alert_min_edge_bps() -> Decimal { Decimal::from(1) }
-fn default_alert_min_duration_ms() -> i64 { 500 }
-fn default_max_quote_age_ms() -> i64 { 2_000 }
-fn default_trade_vol() -> String { "1".to_string() }
-fn default_trade_leverage() -> i32 { 10 }
-fn default_trade_timeout_ms() -> u64 { 5000 }
+fn default_stats_csv_path() -> String {
+    "stats_snapshots.csv".to_string()
+}
+fn default_slippage_csv_path() -> String {
+    "slippage_events.csv".to_string()
+}
+fn default_mexc_taker_fee_bps() -> Decimal {
+    Decimal::from(6)
+}
+fn default_trade_notional_usdt() -> Decimal {
+    Decimal::from(300)
+}
+fn default_telegram_subscribers_path() -> String {
+    "telegram_subscribers.json".to_string()
+}
+fn default_alert_diff_bps() -> Decimal {
+    Decimal::new(5, 1)
+}
+fn default_alert_min_edge_bps() -> Decimal {
+    Decimal::from(1)
+}
+fn default_alert_min_duration_ms() -> i64 {
+    500
+}
+fn default_max_quote_age_ms() -> i64 {
+    2_000
+}
+fn default_trade_vol() -> String {
+    "1".to_string()
+}
+fn default_trade_leverage() -> i32 {
+    10
+}
+fn default_trade_timeout_ms() -> u64 {
+    5000
+}
 
 fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string("config.json").context("read config.json")?;
@@ -521,7 +551,10 @@ fn load_config() -> Result<Config> {
             if let Some(v) = local.get("telegram_chat_id").and_then(|x| x.as_str()) {
                 config.telegram_chat_id = v.to_string();
             }
-            if let Some(v) = local.get("telegram_login_password").and_then(|x| x.as_str()) {
+            if let Some(v) = local
+                .get("telegram_login_password")
+                .and_then(|x| x.as_str())
+            {
                 config.telegram_login_password = v.to_string();
             }
             if let Some(v) = local.get("mexc_api_key").and_then(|x| x.as_str()) {
@@ -540,10 +573,14 @@ fn load_config() -> Result<Config> {
         config.telegram_chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
     }
     if config.telegram_login_password.is_empty() {
-        config.telegram_login_password = std::env::var("TELEGRAM_LOGIN_PASSWORD").unwrap_or_default();
+        config.telegram_login_password =
+            std::env::var("TELEGRAM_LOGIN_PASSWORD").unwrap_or_default();
     }
 
-    anyhow::ensure!(!config.symbols.is_empty(), "config.symbols must not be empty");
+    anyhow::ensure!(
+        !config.symbols.is_empty(),
+        "config.symbols must not be empty"
+    );
     Ok(config)
 }
 
@@ -571,8 +608,12 @@ fn hash_password(password: &str) -> Result<String> {
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(hash) else { return false; };
-    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 fn add_user_interactive() -> Result<()> {
@@ -596,7 +637,10 @@ fn add_user_interactive() -> Result<()> {
 
     let hash = hash_password(&password)?;
     users.retain(|u| u.username != username);
-    users.push(User { username: username.clone(), hash });
+    users.push(User {
+        username: username.clone(),
+        hash,
+    });
     std::fs::write(USERS_PATH, serde_json::to_string_pretty(&users)?)?;
     println!("User '{}' saved.", username);
     Ok(())
@@ -650,11 +694,19 @@ async fn login_handler(
     {
         let attempts = state.login_attempts.lock().await;
         if attempts.is_blocked(&ip) {
-            return (StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts, wait 15 minutes").into_response();
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many failed attempts, wait 15 minutes",
+            )
+                .into_response();
         }
     }
 
-    let user = state.users.iter().find(|u| u.username == req.username).cloned();
+    let user = state
+        .users
+        .iter()
+        .find(|u| u.username == req.username)
+        .cloned();
     let valid = match user {
         Some(u) => {
             let pw = req.password.clone();
@@ -684,10 +736,13 @@ async fn login_handler(
             .map(|c| c as char)
             .collect();
         let expires_ms = now_ms() + 7 * 24 * 60 * 60 * 1_000;
-        state.sessions.write().await.insert(token.clone(), Session {
-            username: req.username,
-            expires_ms,
-        });
+        state.sessions.write().await.insert(
+            token.clone(),
+            Session {
+                username: req.username,
+                expires_ms,
+            },
+        );
         (StatusCode::OK, Json(LoginResponse { token })).into_response()
     } else {
         state.login_attempts.lock().await.record_failure(&ip);
@@ -727,10 +782,7 @@ async fn keys_get(State(state): State<AppState>) -> Json<KeysStatus> {
     Json(KeysStatus { active })
 }
 
-async fn keys_post(
-    State(state): State<AppState>,
-    Json(req): Json<KeysRequest>,
-) -> StatusCode {
+async fn keys_post(State(state): State<AppState>, Json(req): Json<KeysRequest>) -> StatusCode {
     if let Err(e) = save_mexc_keys(&req.mexc_api_key, &req.mexc_api_secret) {
         eprintln!("[keys] failed to save to telegram_config.json: {e:#}");
         return StatusCode::INTERNAL_SERVER_ERROR;
@@ -740,7 +792,11 @@ async fn keys_post(
         *client = None;
         eprintln!("[trade] API keys cleared");
     } else {
-        *client = Some(Arc::new(MexcTradeClient::new(req.mexc_api_key, req.mexc_api_secret, 1)));
+        *client = Some(Arc::new(MexcTradeClient::new(
+            req.mexc_api_key,
+            req.mexc_api_secret,
+            1,
+        )));
         eprintln!("[trade] API keys updated, client active");
     }
     StatusCode::OK
@@ -748,13 +804,18 @@ async fn keys_post(
 
 fn save_mexc_keys(api_key: &str, api_secret: &str) -> Result<()> {
     const PATH: &str = "telegram_config.json";
-    let mut obj: serde_json::Map<String, serde_json::Value> =
-        std::fs::read_to_string(PATH)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-    obj.insert("mexc_api_key".to_string(), serde_json::Value::String(api_key.to_string()));
-    obj.insert("mexc_api_secret".to_string(), serde_json::Value::String(api_secret.to_string()));
+    let mut obj: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(PATH)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    obj.insert(
+        "mexc_api_key".to_string(),
+        serde_json::Value::String(api_key.to_string()),
+    );
+    obj.insert(
+        "mexc_api_secret".to_string(),
+        serde_json::Value::String(api_secret.to_string()),
+    );
     std::fs::write(PATH, serde_json::to_string_pretty(&obj)?)?;
     Ok(())
 }
@@ -806,7 +867,7 @@ async fn handle_quote(
     stats: &mut Stats,
     csv: &mut File,
     slippage_csv: &mut File,
-    trade_client: Option<Arc<MexcTradeClient>>,
+    trade_client: &SharedTradeClient,
     live_cfg: &SharedLiveConfig,
 ) -> Result<()> {
     let live = live_cfg.read().await.clone();
@@ -822,8 +883,12 @@ async fn handle_quote(
             state.last_binance = Some(update.clone());
 
             'detect: {
-                let Some(prev) = prev else { break 'detect; };
-                let Some(mexc) = state.last_mexc.clone() else { break 'detect; };
+                let Some(prev) = prev else {
+                    break 'detect;
+                };
+                let Some(mexc) = state.last_mexc.clone() else {
+                    break 'detect;
+                };
                 let elapsed = update.recv_ts_ms - prev.recv_ts_ms;
                 if elapsed < 0 || elapsed > config.impulse_window_ms {
                     break 'detect;
@@ -864,7 +929,9 @@ async fn handle_quote(
             state.last_mexc = Some(update.clone());
 
             'detect: {
-                let Some(pending) = state.pending.clone() else { break 'detect; };
+                let Some(pending) = state.pending.clone() else {
+                    break 'detect;
+                };
 
                 if now - pending.created_recv_ts_ms > live.max_lag_ms {
                     state.pending = None;
@@ -904,7 +971,8 @@ async fn handle_quote(
                     mexc_recv_ts_ms: update.recv_ts_ms,
                 };
                 write_record(csv, &record)?;
-                let estimate = write_slippage_record(slippage_csv, config, &live, &record, &pending, &update)?;
+                let estimate =
+                    write_slippage_record(slippage_csv, config, &live, &record, &pending, &update)?;
                 stats.set_trade_estimate(&record.symbol, estimate);
                 stats.add_lag(&record.symbol, record.lag_ms);
                 state.pending = None;
@@ -917,8 +985,15 @@ async fn handle_quote(
     Ok(())
 }
 
-async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig, state: &mut SymbolState, trade_client: Option<Arc<MexcTradeClient>>) {
-    let (Some(binance), Some(mexc)) = (state.last_binance.as_ref(), state.last_mexc.as_ref()) else {
+async fn check_price_diff_alert(
+    symbol: &str,
+    config: &Config,
+    live: &LiveConfig,
+    state: &mut SymbolState,
+    trade_client: &SharedTradeClient,
+) {
+    let (Some(binance), Some(mexc)) = (state.last_binance.as_ref(), state.last_mexc.as_ref())
+    else {
         return;
     };
     if live.alert_diff_bps <= Decimal::ZERO {
@@ -934,7 +1009,12 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
     let diff_usdt = m_mid - b_mid;
     let diff_bps = diff_usdt / b_mid * Decimal::from(10_000);
     let abs_diff_bps = diff_bps.abs();
-    let edge = estimate_diff_edge(binance, mexc, diff_bps, live.trade_margin_usdt * Decimal::from(live.trade_leverage));
+    let edge = estimate_diff_edge(
+        binance,
+        mexc,
+        diff_bps,
+        live.trade_margin_usdt * Decimal::from(live.trade_leverage),
+    );
     let now = now_ms();
     let binance_age_ms = now - binance.recv_ts_ms;
     let mexc_age_ms = now - mexc.recv_ts_ms;
@@ -994,10 +1074,8 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
                         edge_bps = edge.edge_zero_fee_bps.round_dp(3),
                         pnl = edge.pnl_zero_fee_usdt.round_dp(4),
                     );
-                    send_telegram_to_subscribers(config, &text);
-
                     if live.trade_enabled && state.active_trade_close.is_none() {
-                        if let Some(client) = trade_client.clone() {
+                        if let Some(client) = trade_client.read().await.clone() {
                             let trade_direction = if diff_usdt < Decimal::ZERO { 1 } else { -1 };
                             let (close_tx, close_rx) = tokio::sync::oneshot::channel();
                             state.active_trade_close = Some(close_tx);
@@ -1013,6 +1091,7 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
                             ));
                         }
                     }
+                    send_telegram_to_subscribers(config, &text);
                 }
             }
             None => {
@@ -1024,6 +1103,8 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
                 } else {
                     "MEXC ниже Binance".to_string()
                 };
+                let should_fire_now = config.alert_min_duration_ms <= 0
+                    && edge.edge_zero_fee_bps >= config.alert_min_edge_bps;
                 state.active_diff_alert = Some(ActiveDiffAlert {
                     started_ms: now,
                     direction: direction.clone(),
@@ -1032,8 +1113,25 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
                     max_abs_diff_bps: abs_diff_bps,
                     start_edge_zero_fee_bps: edge.edge_zero_fee_bps,
                     max_edge_zero_fee_bps: edge.edge_zero_fee_bps,
-                    notified: false,
+                    notified: should_fire_now,
                 });
+                if should_fire_now && live.trade_enabled && state.active_trade_close.is_none() {
+                    if let Some(client) = trade_client.read().await.clone() {
+                        let trade_direction = if diff_usdt < Decimal::ZERO { 1 } else { -1 };
+                        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+                        state.active_trade_close = Some(close_tx);
+                        tokio::spawn(client.run_trade(
+                            symbol.to_string(),
+                            trade_direction,
+                            m_mid,
+                            b_mid,
+                            config.trade_vol.clone(),
+                            live.trade_leverage,
+                            config.trade_timeout_ms,
+                            close_rx,
+                        ));
+                    }
+                }
             }
         }
     } else if let Some(active) = state.active_diff_alert.take() {
@@ -1071,7 +1169,12 @@ async fn check_price_diff_alert(symbol: &str, config: &Config, live: &LiveConfig
     }
 }
 
-fn estimate_diff_edge(binance: &QuoteUpdate, mexc: &QuoteUpdate, diff_bps: Decimal, notional_usdt: Decimal) -> DiffEdgeEstimate {
+fn estimate_diff_edge(
+    binance: &QuoteUpdate,
+    mexc: &QuoteUpdate,
+    diff_bps: Decimal,
+    notional_usdt: Decimal,
+) -> DiffEdgeEstimate {
     let b_mid = binance.mid();
     let mexc_spread_bps = spread_bps(mexc.bid, mexc.ask);
     let edge_zero_fee_bps = if b_mid <= Decimal::ZERO {
@@ -1098,7 +1201,10 @@ fn send_telegram_to_subscribers(config: &Config, text: &str) {
     }
     let token = config.telegram_bot_token.clone();
     let text = text.to_string();
-    eprintln!("[telegram] sending alert to {} subscriber(s)", subscribers.len());
+    eprintln!(
+        "[telegram] sending alert to {} subscriber(s)",
+        subscribers.len()
+    );
     tokio::spawn(async move {
         for chat_id in subscribers {
             if let Err(e) = telegram_send_raw(&token, &chat_id, &text).await {
@@ -1108,7 +1214,12 @@ fn send_telegram_to_subscribers(config: &Config, text: &str) {
     });
 }
 
-fn expire_old_pending(_config: &Config, live: &LiveConfig, states: &mut HashMap<String, SymbolState>, stats: &mut Stats) {
+fn expire_old_pending(
+    _config: &Config,
+    live: &LiveConfig,
+    states: &mut HashMap<String, SymbolState>,
+    stats: &mut Stats,
+) {
     let now = now_ms();
     for (symbol, state) in states.iter_mut() {
         if let Some(pending) = &state.pending {
@@ -1121,10 +1232,19 @@ fn expire_old_pending(_config: &Config, live: &LiveConfig, states: &mut HashMap<
     }
 }
 
-fn print_stats(config: &Config, live: &LiveConfig, states: &HashMap<String, SymbolState>, stats: &Stats) {
+fn print_stats(
+    config: &Config,
+    live: &LiveConfig,
+    states: &HashMap<String, SymbolState>,
+    stats: &Stats,
+) {
     let mut stdout = io::stdout();
     let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
-    println!("=== MEXC LAG MONITOR {} | symbols={} ===", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"), config.symbols.len());
+    println!(
+        "=== MEXC LAG MONITOR {} | symbols={} ===",
+        Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        config.symbols.len()
+    );
     println!("{}", stats.summary());
     println!(
         "thresholds: impulse>={}bps confirm>={}bps max_lag={}ms window={}ms",
@@ -1132,14 +1252,27 @@ fn print_stats(config: &Config, live: &LiveConfig, states: &HashMap<String, Symb
     );
     println!(
         "{:<12} {:>8} {:>8} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>12} {:>12} {:>8}",
-        "symbol", "bnc_q", "mexc_q", "imp", "match", "exp", "avg", "p50", "p95", "bnc_mid", "mexc_mid", "pending"
+        "symbol",
+        "bnc_q",
+        "mexc_q",
+        "imp",
+        "match",
+        "exp",
+        "avg",
+        "p50",
+        "p95",
+        "bnc_mid",
+        "mexc_mid",
+        "pending"
     );
 
     for symbol in &config.symbols {
         let symbol_stats = stats.by_symbol.get(symbol).cloned().unwrap_or_default();
         let (avg, p50, p95) = symbol_stats
             .lag_summary()
-            .map(|(avg, p50, p95, _min, _max)| (format!("{avg:.0}"), p50.to_string(), p95.to_string()))
+            .map(|(avg, p50, p95, _min, _max)| {
+                (format!("{avg:.0}"), p50.to_string(), p95.to_string())
+            })
             .unwrap_or_else(|| ("-".to_string(), "-".to_string(), "-".to_string()));
         let state = states.get(symbol);
         let b_mid = state
@@ -1194,7 +1327,15 @@ fn write_stats_snapshot(
                     max.to_string(),
                 )
             })
-            .unwrap_or_else(|| ("".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string()));
+            .unwrap_or_else(|| {
+                (
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                )
+            });
         let state = states.get(symbol);
         let binance_mid = state
             .and_then(|s| s.last_binance.as_ref())
@@ -1305,7 +1446,11 @@ fn write_slippage_record(
     file.flush()?;
 
     Ok(LastTradeEstimate {
-        direction: if r.direction > 0 { "UP".to_string() } else { "DOWN".to_string() },
+        direction: if r.direction > 0 {
+            "UP".to_string()
+        } else {
+            "DOWN".to_string()
+        },
         lag_ms: r.lag_ms,
         gross_cross_bps,
         net_fee_bps: net_cross_bps,
@@ -1339,14 +1484,19 @@ fn write_record(csv: &mut File, r: &LagRecord) -> Result<()> {
 // ── WebSocket feeds ───────────────────────────────────────────────────────────
 
 async fn run_binance(config: Config, tx: mpsc::Sender<QuoteUpdate>) {
-    let streams: Vec<String> = config.symbols.iter()
+    let streams: Vec<String> = config
+        .symbols
+        .iter()
         .map(|s| format!("{}@bookTicker", binance_stream_symbol(s)))
         .collect();
     let url = format!("{}?streams={}", config.binance_ws, streams.join("/"));
     let symbols: HashSet<String> = config.symbols.iter().cloned().collect();
 
     loop {
-        eprintln!("[binance] connecting combined stream ({} symbols)", symbols.len());
+        eprintln!(
+            "[binance] connecting combined stream ({} symbols)",
+            symbols.len()
+        );
         if let Err(e) = binance_session(&url, &symbols, &tx).await {
             eprintln!("[binance] session error: {e:#}");
         }
@@ -1374,7 +1524,7 @@ async fn binance_session(
         if let Message::Text(text) = msg {
             for update in parse_binance_book_tickers(&text) {
                 if symbols.contains(&update.symbol) {
-                    if tx.send(update).await.is_err() {
+                    if send_quote(tx, update).is_err() {
                         return Ok(());
                     }
                 }
@@ -1415,7 +1565,7 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
                 let msg = msg?;
                 if let Message::Text(text) = msg {
                     if let Some(update) = parse_mexc_depth(&text) {
-                        if tx.send(update).await.is_err() {
+                        if send_quote(tx, update).is_err() {
                             break;
                         }
                     }
@@ -1424,6 +1574,17 @@ async fn mexc_session(config: &Config, tx: &mpsc::Sender<QuoteUpdate>) -> Result
         }
     }
     Ok(())
+}
+
+fn send_quote(
+    tx: &mpsc::Sender<QuoteUpdate>,
+    update: QuoteUpdate,
+) -> std::result::Result<(), mpsc::error::TrySendError<QuoteUpdate>> {
+    match tx.try_send(update) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(e @ mpsc::error::TrySendError::Closed(_)) => Err(e),
+    }
 }
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
@@ -1488,7 +1649,9 @@ struct MexcDepthData {
 
 fn parse_mexc_depth(text: &str) -> Option<QuoteUpdate> {
     let msg: MexcDepthMsg = serde_json::from_str(text).ok()?;
-    if msg.channel.as_deref() != Some("push.depth.full") && msg.channel.as_deref() != Some("push.depth") {
+    if msg.channel.as_deref() != Some("push.depth.full")
+        && msg.channel.as_deref() != Some("push.depth")
+    {
         return None;
     }
     let data = msg.data?;
@@ -1512,7 +1675,11 @@ fn best_price(levels: &[Vec<Decimal>], is_bid: bool) -> Option<Decimal> {
         .filter_map(|level| level.first().copied())
         .filter(|p| *p > Decimal::ZERO)
         .reduce(|best, price| {
-            if is_bid { best.max(price) } else { best.min(price) }
+            if is_bid {
+                best.max(price)
+            } else {
+                best.min(price)
+            }
         })
 }
 
@@ -1574,16 +1741,30 @@ fn build_dashboard_snapshot(
                     .map(|q| q.mid().round_dp(6).to_string()),
                 price_diff_usdt: price_diff.map(|x| x.round_dp(6).to_string()),
                 price_diff_bps: price_diff_bps.map(|x| x.round_dp(3).to_string()),
-                pending: state
-                    .and_then(|s| s.pending.as_ref())
-                    .map(|p| if p.direction > 0 { "UP".to_string() } else { "DOWN".to_string() }),
+                pending: state.and_then(|s| s.pending.as_ref()).map(|p| {
+                    if p.direction > 0 {
+                        "UP".to_string()
+                    } else {
+                        "DOWN".to_string()
+                    }
+                }),
                 last_direction: last_trade.as_ref().map(|x| x.direction.clone()),
                 last_lag_ms: last_trade.as_ref().map(|x| x.lag_ms),
-                gross_bps: last_trade.as_ref().map(|x| x.gross_cross_bps.round_dp(3).to_string()),
-                net_fee_bps: last_trade.as_ref().map(|x| x.net_fee_bps.round_dp(3).to_string()),
-                net_zero_fee_bps: last_trade.as_ref().map(|x| x.net_zero_fee_bps.round_dp(3).to_string()),
-                pnl_fee_usdt: last_trade.as_ref().map(|x| x.pnl_fee_usdt.round_dp(4).to_string()),
-                pnl_zero_fee_usdt: last_trade.as_ref().map(|x| x.pnl_zero_fee_usdt.round_dp(4).to_string()),
+                gross_bps: last_trade
+                    .as_ref()
+                    .map(|x| x.gross_cross_bps.round_dp(3).to_string()),
+                net_fee_bps: last_trade
+                    .as_ref()
+                    .map(|x| x.net_fee_bps.round_dp(3).to_string()),
+                net_zero_fee_bps: last_trade
+                    .as_ref()
+                    .map(|x| x.net_zero_fee_bps.round_dp(3).to_string()),
+                pnl_fee_usdt: last_trade
+                    .as_ref()
+                    .map(|x| x.pnl_fee_usdt.round_dp(4).to_string()),
+                pnl_zero_fee_usdt: last_trade
+                    .as_ref()
+                    .map(|x| x.pnl_zero_fee_usdt.round_dp(4).to_string()),
             }
         })
         .collect();
@@ -1606,7 +1787,10 @@ async fn run_dashboard(state: AppState) {
         .route("/api/config", get(config_get).post(config_post))
         .route("/api/keys", get(keys_get).post(keys_post))
         .route("/api/trade-stats", get(trade_stats_handler))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     let app = Router::new()
         .route("/", get(dashboard_html))
@@ -1625,7 +1809,8 @@ async fn run_dashboard(state: AppState) {
     let _ = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    ).await;
+    )
+    .await;
 }
 
 async fn dashboard_state(State(state): State<AppState>) -> Json<DashboardSnapshot> {
@@ -1636,7 +1821,10 @@ async fn config_get(State(state): State<AppState>) -> Json<LiveConfig> {
     Json(state.live_cfg.read().await.clone())
 }
 
-async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConfig>) -> impl IntoResponse {
+async fn config_post(
+    State(state): State<AppState>,
+    Json(new_cfg): Json<LiveConfig>,
+) -> impl IntoResponse {
     *state.live_cfg.write().await = new_cfg.clone();
     // Persist live fields back into config.json so they survive restart.
     if let Ok(text) = std::fs::read_to_string(state.config_path.as_str()) {
@@ -1690,12 +1878,18 @@ async fn trade_stats_handler(
     let min_lag_ms = query.min_lag_ms.unwrap_or(200);
     let path = state.slippage_csv_path.as_str();
     let live = state.live_cfg.read().await;
-    let margin = live.trade_margin_usdt.to_string().parse::<f64>().unwrap_or(300.0);
+    let margin = live
+        .trade_margin_usdt
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(300.0);
     let leverage = live.trade_leverage as f64;
     let notional = margin * leverage;
     drop(live);
 
-    struct Row { gross: f64 }
+    struct Row {
+        gross: f64,
+    }
     let (total, rows): (usize, Vec<Row>) = {
         let mut total = 0usize;
         let rows = std::fs::read_to_string(path)
@@ -1704,11 +1898,17 @@ async fn trade_stats_handler(
             .skip(1)
             .filter_map(|line| {
                 let cols: Vec<&str> = line.split(',').collect();
-                if MAJOR_SYMBOLS.contains(cols.get(1)?) { return None; }
+                if MAJOR_SYMBOLS.contains(cols.get(1)?) {
+                    return None;
+                }
                 let lag: i64 = cols.get(3)?.parse().ok()?;
                 let gross: f64 = cols.get(10)?.parse().ok()?;
                 total += 1;
-                if lag >= min_lag_ms && gross > ALTCOIN_FEE_BPS { Some(Row { gross }) } else { None }
+                if lag >= min_lag_ms && gross > ALTCOIN_FEE_BPS {
+                    Some(Row { gross })
+                } else {
+                    None
+                }
             })
             .collect();
         // total counts all altcoin rows regardless of filters
@@ -1718,7 +1918,9 @@ async fn trade_stats_handler(
             .skip(1)
             .filter(|line| {
                 let cols: Vec<&str> = line.split(',').collect();
-                cols.get(1).map(|s| !MAJOR_SYMBOLS.contains(s)).unwrap_or(false)
+                cols.get(1)
+                    .map(|s| !MAJOR_SYMBOLS.contains(s))
+                    .unwrap_or(false)
             })
             .count();
         (all_total, rows)
@@ -1726,12 +1928,23 @@ async fn trade_stats_handler(
 
     let count = rows.len();
     if count == 0 {
-        return Json(TradeStats { total_detected: total, trade_count: 0, avg_gross_bps: None, avg_net_bps: None, cumulative_pnl_usdt: 0.0, fee_bps: ALTCOIN_FEE_BPS, min_lag_ms });
+        return Json(TradeStats {
+            total_detected: total,
+            trade_count: 0,
+            avg_gross_bps: None,
+            avg_net_bps: None,
+            cumulative_pnl_usdt: 0.0,
+            fee_bps: ALTCOIN_FEE_BPS,
+            min_lag_ms,
+        });
     }
 
     let avg_gross = rows.iter().map(|r| r.gross).sum::<f64>() / count as f64;
     let avg_net = avg_gross - ALTCOIN_FEE_BPS;
-    let cum_pnl: f64 = rows.iter().map(|r| notional * (r.gross - ALTCOIN_FEE_BPS) / 10_000.0).sum();
+    let cum_pnl: f64 = rows
+        .iter()
+        .map(|r| notional * (r.gross - ALTCOIN_FEE_BPS) / 10_000.0)
+        .sum();
 
     Json(TradeStats {
         total_detected: total,
@@ -2092,8 +2305,12 @@ async fn telegram_send_raw(token: &str, chat_id: &str, text: &str) -> Result<()>
         let body = resp.text().await.unwrap_or_default();
         if status.as_u16() == 429 {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(retry_after) = v.pointer("/parameters/retry_after").and_then(|x| x.as_i64()) {
-                    TELEGRAM_BLOCKED_UNTIL_MS.store(now_ms() + retry_after * 1000, Ordering::Relaxed);
+                if let Some(retry_after) = v
+                    .pointer("/parameters/retry_after")
+                    .and_then(|x| x.as_i64())
+                {
+                    TELEGRAM_BLOCKED_UNTIL_MS
+                        .store(now_ms() + retry_after * 1000, Ordering::Relaxed);
                 }
             }
         }
@@ -2110,7 +2327,10 @@ async fn run_telegram_login_bot(config: Config) {
     let client = reqwest::Client::new();
     let mut offset: i64 = 0;
     loop {
-        let url = format!("https://api.telegram.org/bot{}/getUpdates", config.telegram_bot_token);
+        let url = format!(
+            "https://api.telegram.org/bot{}/getUpdates",
+            config.telegram_bot_token
+        );
         let response = client
             .get(&url)
             .query(&[("timeout", "20"), ("offset", &offset.to_string())])
@@ -2124,43 +2344,75 @@ async fn run_telegram_login_bot(config: Config) {
                         if let Some(update_id) = update.get("update_id").and_then(|x| x.as_i64()) {
                             offset = update_id + 1;
                         }
-                        let Some(message) = update.get("message") else { continue; };
-                        let Some(text) = message.get("text").and_then(|x| x.as_str()) else { continue; };
+                        let Some(message) = update.get("message") else {
+                            continue;
+                        };
+                        let Some(text) = message.get("text").and_then(|x| x.as_str()) else {
+                            continue;
+                        };
                         let Some(chat_id) = message
                             .get("chat")
                             .and_then(|x| x.get("id"))
                             .and_then(|x| x.as_i64())
-                            .map(|x| x.to_string()) else { continue; };
+                            .map(|x| x.to_string())
+                        else {
+                            continue;
+                        };
 
                         if text.trim() == "/logout" {
-                            let mut subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+                            let mut subscribers =
+                                load_telegram_subscribers(&config.telegram_subscribers_path);
                             subscribers.retain(|x| x != &chat_id);
-                            let _ = save_telegram_subscribers(&config.telegram_subscribers_path, &subscribers);
-                            let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, "Вы вышли из рассылки отчетов.").await;
+                            let _ = save_telegram_subscribers(
+                                &config.telegram_subscribers_path,
+                                &subscribers,
+                            );
+                            let _ = telegram_send_raw(
+                                &config.telegram_bot_token,
+                                &chat_id,
+                                "Вы вышли из рассылки отчетов.",
+                            )
+                            .await;
                             continue;
                         }
 
                         if text.trim() == "/status" {
-                            let subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+                            let subscribers =
+                                load_telegram_subscribers(&config.telegram_subscribers_path);
                             let msg = if subscribers.contains(&chat_id) {
                                 "Вы залогинены и будете получать отчеты."
                             } else {
                                 "Вы не залогинены. Используйте /login password."
                             };
-                            let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, msg).await;
+                            let _ =
+                                telegram_send_raw(&config.telegram_bot_token, &chat_id, msg).await;
                             continue;
                         }
 
                         if let Some(password) = text.trim().strip_prefix("/login ") {
                             if password.trim() == config.telegram_login_password {
-                                let mut subscribers = load_telegram_subscribers(&config.telegram_subscribers_path);
+                                let mut subscribers =
+                                    load_telegram_subscribers(&config.telegram_subscribers_path);
                                 if !subscribers.contains(&chat_id) {
                                     subscribers.push(chat_id.clone());
-                                    let _ = save_telegram_subscribers(&config.telegram_subscribers_path, &subscribers);
+                                    let _ = save_telegram_subscribers(
+                                        &config.telegram_subscribers_path,
+                                        &subscribers,
+                                    );
                                 }
-                                let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, "Логин успешен. Вы будете получать отчеты каждые 5 часов.").await;
+                                let _ = telegram_send_raw(
+                                    &config.telegram_bot_token,
+                                    &chat_id,
+                                    "Логин успешен. Вы будете получать отчеты каждые 5 часов.",
+                                )
+                                .await;
                             } else {
-                                let _ = telegram_send_raw(&config.telegram_bot_token, &chat_id, "Неверный пароль.").await;
+                                let _ = telegram_send_raw(
+                                    &config.telegram_bot_token,
+                                    &chat_id,
+                                    "Неверный пароль.",
+                                )
+                                .await;
                             }
                         }
                     }

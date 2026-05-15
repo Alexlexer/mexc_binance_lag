@@ -46,8 +46,7 @@ impl MexcTradeClient {
     }
 
     fn sign(&self, ts: u64, body: &str) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(self.api_secret.as_bytes()).expect("hmac init");
+        let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes()).expect("hmac init");
         mac.update(format!("{}{}{}", self.api_key, ts, body).as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -149,7 +148,10 @@ impl MexcTradeClient {
         close_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         if !self.can_open() {
-            eprintln!("[trade] max positions ({}) reached, skipping {symbol}", self.max_positions);
+            eprintln!(
+                "[trade] max positions ({}) reached, skipping {symbol}",
+                self.max_positions
+            );
             return;
         }
         self.open_positions.fetch_add(1, Ordering::Relaxed);

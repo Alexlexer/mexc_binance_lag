@@ -32,4 +32,8 @@ argon2 = "0.5"
 rand = "0.8"
 rpassword = "7"
 
-
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
