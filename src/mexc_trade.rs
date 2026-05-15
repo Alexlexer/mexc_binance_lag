@@ -20,6 +20,20 @@ pub struct MexcTradeClient {
     pub max_positions: i32,
 }
 
+fn log_exchange_response(method: &str, path: &str, value: &serde_json::Value) {
+    let success = value.get("success").and_then(|x| x.as_bool());
+    let code = value.get("code").and_then(|x| x.as_i64());
+    let state = value.pointer("/data/state").and_then(|x| x.as_i64());
+    let order_id = value.get("data").and_then(|x| {
+        x.as_i64()
+            .map(|n| n.to_string())
+            .or_else(|| x.as_str().map(str::to_string))
+    });
+    eprintln!(
+        "[trade] {method} {path}: success={success:?} code={code:?} state={state:?} order_id={order_id:?}"
+    );
+}
+
 impl MexcTradeClient {
     pub fn new(api_key: String, api_secret: String, max_positions: i32) -> Self {
         Self {
@@ -34,8 +48,22 @@ impl MexcTradeClient {
         }
     }
 
-    pub fn can_open(&self) -> bool {
-        self.open_positions.load(Ordering::Relaxed) < self.max_positions
+    fn try_reserve_position(&self) -> bool {
+        let mut current = self.open_positions.load(Ordering::Relaxed);
+        loop {
+            if current >= self.max_positions {
+                return false;
+            }
+            match self.open_positions.compare_exchange(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn ts() -> u64 {
@@ -67,8 +95,9 @@ impl MexcTradeClient {
             .await?
             .text()
             .await?;
-        eprintln!("[trade] POST {path}: {text}");
-        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        log_exchange_response("POST", path, &value);
+        Ok(value)
     }
 
     async fn get(&self, path: &str) -> Result<serde_json::Value> {
@@ -85,8 +114,9 @@ impl MexcTradeClient {
             .await?
             .text()
             .await?;
-        eprintln!("[trade] GET {path}: {text}");
-        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        log_exchange_response("GET", path, &value);
+        Ok(value)
     }
 
     async fn submit_order(
@@ -115,7 +145,12 @@ impl MexcTradeClient {
         .to_string();
         let v = self.post("/api/v1/private/order/submit", body).await?;
         if v["success"].as_bool() != Some(true) {
-            anyhow::bail!("order rejected: {v}");
+            let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or_default();
+            let msg = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("rejected");
+            anyhow::bail!("order rejected: code={code} message={msg}");
         }
         // data is returned as a number (order id)
         let id = if let Some(n) = v["data"].as_i64() {
@@ -147,14 +182,13 @@ impl MexcTradeClient {
         safety_timeout_ms: u64,
         close_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
-        if !self.can_open() {
+        if !self.try_reserve_position() {
             eprintln!(
                 "[trade] max positions ({}) reached, skipping {symbol}",
                 self.max_positions
             );
             return;
         }
-        self.open_positions.fetch_add(1, Ordering::Relaxed);
 
         // side: 1=open_long, 3=open_short, 4=close_long, 2=close_short
         let open_side = if direction > 0 { 1 } else { 3 };

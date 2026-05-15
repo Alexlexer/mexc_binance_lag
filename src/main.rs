@@ -6,7 +6,13 @@ use argon2::{
 };
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::{Request, StatusCode},
+    http::{
+        header::{
+            HeaderName, HeaderValue, CONTENT_SECURITY_POLICY, REFERRER_POLICY,
+            X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+        },
+        Request, StatusCode,
+    },
     middleware::Next,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -33,7 +39,6 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tower_http::cors::CorsLayer;
 
 static TELEGRAM_BLOCKED_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -576,6 +581,12 @@ fn load_config() -> Result<Config> {
         config.telegram_login_password =
             std::env::var("TELEGRAM_LOGIN_PASSWORD").unwrap_or_default();
     }
+    if config.mexc_api_key.is_empty() {
+        config.mexc_api_key = std::env::var("MEXC_API_KEY").unwrap_or_default();
+    }
+    if config.mexc_api_secret.is_empty() {
+        config.mexc_api_secret = std::env::var("MEXC_API_SECRET").unwrap_or_default();
+    }
 
     anyhow::ensure!(
         !config.symbols.is_empty(),
@@ -816,7 +827,28 @@ fn save_mexc_keys(api_key: &str, api_secret: &str) -> Result<()> {
         "mexc_api_secret".to_string(),
         serde_json::Value::String(api_secret.to_string()),
     );
-    std::fs::write(PATH, serde_json::to_string_pretty(&obj)?)?;
+    let text = serde_json::to_string_pretty(&obj)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(PATH)?;
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    restrict_owner_only(PATH)?;
+    Ok(())
+}
+
+fn restrict_owner_only(path: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -1797,10 +1829,10 @@ async fn run_dashboard(state: AppState) {
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))
         .merge(protected)
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8787));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
     let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
         eprintln!("[dashboard] failed to bind {addr}");
         return;
@@ -1821,10 +1853,51 @@ async fn config_get(State(state): State<AppState>) -> Json<LiveConfig> {
     Json(state.live_cfg.read().await.clone())
 }
 
-async fn config_post(
-    State(state): State<AppState>,
-    Json(new_cfg): Json<LiveConfig>,
-) -> impl IntoResponse {
+async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
+    );
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; font-src https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        ),
+    );
+    response
+}
+
+fn validate_live_config(cfg: &LiveConfig) -> std::result::Result<(), &'static str> {
+    if cfg.trade_margin_usdt < Decimal::from(1) || cfg.trade_margin_usdt > Decimal::from(100_000) {
+        return Err("trade_margin_usdt must be between 1 and 100000");
+    }
+    if cfg.trade_leverage < 1 || cfg.trade_leverage > 50 {
+        return Err("trade_leverage must be between 1 and 50");
+    }
+    if cfg.impulse_bps <= Decimal::ZERO || cfg.impulse_bps > Decimal::from(1_000) {
+        return Err("impulse_bps must be between 0 and 1000");
+    }
+    if cfg.confirm_bps <= Decimal::ZERO || cfg.confirm_bps > Decimal::from(1_000) {
+        return Err("confirm_bps must be between 0 and 1000");
+    }
+    if cfg.alert_diff_bps <= Decimal::ZERO || cfg.alert_diff_bps > Decimal::from(10_000) {
+        return Err("alert_diff_bps must be between 0 and 10000");
+    }
+    if cfg.max_lag_ms < 100 || cfg.max_lag_ms > 5_000 {
+        return Err("max_lag_ms must be between 100 and 5000");
+    }
+    Ok(())
+}
+
+async fn config_post(State(state): State<AppState>, Json(new_cfg): Json<LiveConfig>) -> Response {
+    if let Err(msg) = validate_live_config(&new_cfg) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
     *state.live_cfg.write().await = new_cfg.clone();
     // Persist live fields back into config.json so they survive restart.
     if let Ok(text) = std::fs::read_to_string(state.config_path.as_str()) {
@@ -1841,7 +1914,7 @@ async fn config_post(
             }
         }
     }
-    Json(new_cfg)
+    Json(new_cfg).into_response()
 }
 
 // BTC/ETH/SOL have non-zero maker fees on MEXC futures; excluded from PnL simulation.
@@ -1994,7 +2067,14 @@ fn load_telegram_subscribers(path: &str) -> Vec<String> {
 
 fn save_telegram_subscribers(path: &str, subscribers: &[String]) -> Result<()> {
     let text = serde_json::to_string_pretty(subscribers)?;
-    std::fs::write(path, text)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    restrict_owner_only(path)?;
     Ok(())
 }
 
@@ -2038,10 +2118,15 @@ async fn telegram_send_raw(token: &str, chat_id: &str, text: &str) -> Result<()>
 }
 
 async fn run_telegram_login_bot(config: Config) {
-    if config.telegram_bot_token.is_empty() || config.telegram_login_password.is_empty() {
+    if config.telegram_bot_token.is_empty() {
+        return;
+    }
+    if config.telegram_chat_id.trim().is_empty() {
+        eprintln!("[telegram] login bot disabled: set telegram_chat_id to an allowed chat id");
         return;
     }
 
+    let allowed_chat_id = config.telegram_chat_id.trim().to_string();
     let client = reqwest::Client::new();
     let mut offset: i64 = 0;
     loop {
@@ -2077,6 +2162,16 @@ async fn run_telegram_login_bot(config: Config) {
                             continue;
                         };
 
+                        if chat_id != allowed_chat_id {
+                            let _ = telegram_send_raw(
+                                &config.telegram_bot_token,
+                                &chat_id,
+                                "Доступ запрещен для этого Telegram чата.",
+                            )
+                            .await;
+                            continue;
+                        }
+
                         if text.trim() == "/logout" {
                             let mut subscribers =
                                 load_telegram_subscribers(&config.telegram_subscribers_path);
@@ -2100,38 +2195,36 @@ async fn run_telegram_login_bot(config: Config) {
                             let msg = if subscribers.contains(&chat_id) {
                                 "Вы залогинены и будете получать отчеты."
                             } else {
-                                "Вы не залогинены. Используйте /login password."
+                                "Вы не залогинены. Используйте /login из разрешенного чата."
                             };
                             let _ =
                                 telegram_send_raw(&config.telegram_bot_token, &chat_id, msg).await;
                             continue;
                         }
 
-                        if let Some(password) = text.trim().strip_prefix("/login ") {
-                            if password.trim() == config.telegram_login_password {
-                                let mut subscribers =
-                                    load_telegram_subscribers(&config.telegram_subscribers_path);
-                                if !subscribers.contains(&chat_id) {
-                                    subscribers.push(chat_id.clone());
-                                    let _ = save_telegram_subscribers(
-                                        &config.telegram_subscribers_path,
-                                        &subscribers,
-                                    );
-                                }
-                                let _ = telegram_send_raw(
-                                    &config.telegram_bot_token,
-                                    &chat_id,
-                                    "Логин успешен. Вы будете получать отчеты каждые 5 часов.",
-                                )
-                                .await;
-                            } else {
-                                let _ = telegram_send_raw(
-                                    &config.telegram_bot_token,
-                                    &chat_id,
-                                    "Неверный пароль.",
-                                )
-                                .await;
+                        if text.trim() == "/login" {
+                            let mut subscribers =
+                                load_telegram_subscribers(&config.telegram_subscribers_path);
+                            if !subscribers.contains(&chat_id) {
+                                subscribers.push(chat_id.clone());
+                                let _ = save_telegram_subscribers(
+                                    &config.telegram_subscribers_path,
+                                    &subscribers,
+                                );
                             }
+                            let _ = telegram_send_raw(
+                                &config.telegram_bot_token,
+                                &chat_id,
+                                "Логин успешен. Вы будете получать отчеты каждые 5 часов.",
+                            )
+                            .await;
+                        } else if text.trim().starts_with("/login ") {
+                            let _ = telegram_send_raw(
+                                &config.telegram_bot_token,
+                                &chat_id,
+                                "Не отправляйте пароль в Telegram. Используйте /login из разрешенного чата.",
+                            )
+                            .await;
                         }
                     }
                 }

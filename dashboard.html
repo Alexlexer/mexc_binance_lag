@@ -618,8 +618,12 @@
     // ── Helpers ────────────────────────────────────────────────────
     const fmt = (v, suf = '') => (v === null || v === undefined || v === '') ? '—' : `${v}${suf}`;
     const num = (v) => (v === null || v === undefined || v === '') ? null : parseFloat(v);
-    function sym2tag(s) { return s.split('_')[0].slice(0, 4); }
-    function sym2display(s) { return s.replace('_', '/'); }
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+    const safe = (v, suf = '') => esc(fmt(v, suf));
+    function sym2tag(s) { return String(s || '').split('_')[0].slice(0, 4); }
+    function sym2display(s) { return String(s || '').replace('_', '/'); }
 
     function setPill(kind, text) {
       const p = document.getElementById('statusPill');
@@ -774,22 +778,22 @@
           <tr class="${cls.trim()}">
             <td class="sym">
               <div class="sym-row">
-                <div class="sym-tag">${sym2tag(r.symbol)}</div>
-                <div>${sym2display(r.symbol)}<div class="sym-sub">perp</div></div>
+                <div class="sym-tag">${esc(sym2tag(r.symbol))}</div>
+                <div>${esc(sym2display(r.symbol))}<div class="sym-sub">perp</div></div>
               </div>
             </td>
-            <td>${fmt(r.binance_mid)}</td>
-            <td>${fmt(r.mexc_mid)}</td>
-            <td class="${diffCls}">${fmt(r.price_diff_usdt)}</td>
-            <td class="${diffCls}">${fmt(r.price_diff_bps)}</td>
-            <td>${r.impulses}</td>
-            <td>${r.matched}</td>
-            <td>${fmt(r.avg_lag_ms)}</td>
-            <td>${fmt(r.p95_lag_ms)}</td>
-            <td class="${netFeeCls}">${fmt(r.net_fee_bps)}</td>
-            <td class="${net0Cls}">${fmt(r.net_zero_fee_bps)}</td>
-            <td class="${pnl0Cls}">${fmt(r.pnl_zero_fee_usdt)}</td>
-            <td class="muted">${pendingTxt}</td>
+            <td>${safe(r.binance_mid)}</td>
+            <td>${safe(r.mexc_mid)}</td>
+            <td class="${diffCls}">${safe(r.price_diff_usdt)}</td>
+            <td class="${diffCls}">${safe(r.price_diff_bps)}</td>
+            <td>${safe(r.impulses)}</td>
+            <td>${safe(r.matched)}</td>
+            <td>${safe(r.avg_lag_ms)}</td>
+            <td>${safe(r.p95_lag_ms)}</td>
+            <td class="${netFeeCls}">${safe(r.net_fee_bps)}</td>
+            <td class="${net0Cls}">${safe(r.net_zero_fee_bps)}</td>
+            <td class="${pnl0Cls}">${safe(r.pnl_zero_fee_usdt)}</td>
+            <td class="muted">${esc(pendingTxt)}</td>
           </tr>`;
       }).join('');
       return `<div class="table-wrap"><table class="pairs">${head}<tbody>${body}</tbody></table></div>`;
@@ -809,28 +813,28 @@
         return `
           <div class="card-cell">
             <div class="card-head">
-              <div class="card-sym">${sym2display(r.symbol)}</div>
+              <div class="card-sym">${esc(sym2display(r.symbol))}</div>
               ${pill}
             </div>
             <div class="card-prices">
               <div class="card-px">
                 <div class="card-px-label">Binance</div>
-                <div class="card-px-val">${fmt(r.binance_mid)}</div>
+                <div class="card-px-val">${safe(r.binance_mid)}</div>
               </div>
               <div class="card-px">
                 <div class="card-px-label">MEXC</div>
-                <div class="card-px-val">${fmt(r.mexc_mid)}</div>
+                <div class="card-px-val">${safe(r.mexc_mid)}</div>
               </div>
               <div class="card-px">
                 <div class="card-px-label">Δ bps</div>
-                <div class="card-px-val ${diffCls}">${fmt(r.price_diff_bps)}</div>
+                <div class="card-px-val ${diffCls}">${safe(r.price_diff_bps)}</div>
               </div>
             </div>
             <dl class="card-meta">
-              <dt>Imp / match</dt><dd>${r.impulses} / ${r.matched}</dd>
-              <dt>Avg lag</dt><dd>${fmt(r.avg_lag_ms, ' ms')}</dd>
-              <dt>p95</dt><dd>${fmt(r.p95_lag_ms, ' ms')}</dd>
-              <dt>PnL 0</dt><dd class="${pnl0Cls}">${fmt(r.pnl_zero_fee_usdt)}</dd>
+              <dt>Imp / match</dt><dd>${safe(r.impulses)} / ${safe(r.matched)}</dd>
+              <dt>Avg lag</dt><dd>${safe(r.avg_lag_ms, ' ms')}</dd>
+              <dt>p95</dt><dd>${safe(r.p95_lag_ms, ' ms')}</dd>
+              <dt>PnL 0</dt><dd class="${pnl0Cls}">${safe(r.pnl_zero_fee_usdt)}</dd>
             </dl>
           </div>`;
       }).join('');
