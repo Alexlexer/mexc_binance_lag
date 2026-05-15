@@ -1,0 +1,18 @@
+services:
+  mexc-lag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mexc-lag:latest
+    container_name: mexc-lag
+    restart: unless-stopped
+    networks:
+      - trader_net
+    volumes:
+      - ./deploy-data:/app
+    environment:
+      RUST_LOG: warn
+
+networks:
+  trader_net:
+    external: true

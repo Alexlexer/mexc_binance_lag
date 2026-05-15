@@ -197,6 +197,8 @@ struct Config {
     trade_leverage: i32,
     #[serde(default = "default_trade_timeout_ms")]
     trade_timeout_ms: u64,
+    #[serde(default = "default_dashboard_bind")]
+    dashboard_bind: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,7 +465,7 @@ async fn main() -> Result<()> {
         config_path: Arc::new("config.json".to_string()),
     };
 
-    tokio::spawn(run_dashboard(app_state));
+    tokio::spawn(run_dashboard(app_state, config.dashboard_bind.clone()));
     tokio::spawn(run_telegram_login_bot(config.clone()));
     open_dashboard_in_browser();
 
@@ -542,6 +544,9 @@ fn default_trade_leverage() -> i32 {
 }
 fn default_trade_timeout_ms() -> u64 {
     5000
+}
+fn default_dashboard_bind() -> String {
+    "127.0.0.1:8787".to_string()
 }
 
 fn load_config() -> Result<Config> {
@@ -1813,7 +1818,7 @@ fn build_dashboard_snapshot(
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
-async fn run_dashboard(state: AppState) {
+async fn run_dashboard(state: AppState, bind_addr: String) {
     let protected = Router::new()
         .route("/api/state", get(dashboard_state))
         .route("/api/config", get(config_get).post(config_post))
@@ -1832,7 +1837,9 @@ async fn run_dashboard(state: AppState) {
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 8787)));
     let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
         eprintln!("[dashboard] failed to bind {addr}");
         return;
@@ -1866,7 +1873,7 @@ async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Res
     headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; connect-src 'self'; img-src 'self' data:; font-src https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; font-src https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; upgrade-insecure-requests",
         ),
     );
     response

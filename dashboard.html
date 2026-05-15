@@ -527,6 +527,13 @@
 
     const TOKEN_KEY = 'lagmon_token';
     const PREF_KEY  = 'lagmon_prefs';
+    const BASE_PATH = (() => {
+      const path = window.location.pathname;
+      if (path === '/lag') return '/lag';
+      if (path.startsWith('/lag/')) return '/lag';
+      return '';
+    })();
+    const api = (path) => BASE_PATH + path;
 
     // ── Prefs (theme / layout / density / min-lag) ─────────────────
     const prefs = Object.assign(
@@ -583,7 +590,7 @@
       err.textContent = '';
       if (!u || !p) { err.textContent = 'Заполните все поля'; return; }
       try {
-        const r = await fetch('/api/login', {
+        const r = await fetch(api('/api/login'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username: u, password: p })
@@ -606,7 +613,7 @@
 
     function doLogout() {
       const t = tok();
-      if (t) fetch('/api/logout', { method: 'POST', headers: authH() }).catch(() => {});
+      if (t) fetch(api('/api/logout'), { method: 'POST', headers: authH() }).catch(() => {});
       sessionStorage.removeItem(TOKEN_KEY);
       showLogin();
     }
@@ -633,7 +640,7 @@
 
     // ── Config ─────────────────────────────────────────────────────
     async function loadConfig() {
-      const r = await fetch('/api/config', { headers: authH() }).catch(() => null);
+      const r = await fetch(api('/api/config'), { headers: authH() }).catch(() => null);
       if (!r) return;
       if (r.status === 401) { handle401(); return; }
       const c = await r.json();
@@ -662,7 +669,7 @@
         alert_diff_bps: parseFloat(document.getElementById('cfgAlert').value),
         trade_enabled: document.getElementById('cfgTrade').checked,
       };
-      const r = await fetch('/api/config', {
+      const r = await fetch(api('/api/config'), {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json' }, authH()),
         body: JSON.stringify(body)
@@ -676,7 +683,7 @@
     }
 
     async function loadKeys() {
-      const r = await fetch('/api/keys', { headers: authH() }).catch(() => null);
+      const r = await fetch(api('/api/keys'), { headers: authH() }).catch(() => null);
       if (!r || r.status === 401) return;
       const d = await r.json();
       const st = document.getElementById('keysStatus');
@@ -690,7 +697,7 @@
       const st = document.getElementById('keysStatus');
       st.textContent = '';
       if (!key || !secret) { st.textContent = 'fill both fields'; st.classList.add('err'); return; }
-      const r = await fetch('/api/keys', {
+      const r = await fetch(api('/api/keys'), {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json' }, authH()),
         body: JSON.stringify({ mexc_api_key: key, mexc_api_secret: secret })
@@ -709,7 +716,7 @@
     let lastRows = [];
 
     async function refresh() {
-      const r = await fetch('/api/state', { cache: 'no-store', headers: authH() }).catch(() => null);
+      const r = await fetch(api('/api/state'), { cache: 'no-store', headers: authH() }).catch(() => null);
       if (!r) { setPill('err', 'offline'); return; }
       if (r.status === 401) { handle401(); return; }
       const data = await r.json();
@@ -843,7 +850,7 @@
 
     // ── Trade stats ────────────────────────────────────────────────
     async function loadTradeStats() {
-      const r = await fetch(`/api/trade-stats?min_lag_ms=${prefs.minLag}`, { headers: authH() })
+      const r = await fetch(api(`/api/trade-stats?min_lag_ms=${prefs.minLag}`), { headers: authH() })
         .catch(() => null);
       if (!r || r.status === 401) return;
       const d = await r.json();

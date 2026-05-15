@@ -1,13 +1,13 @@
 {
-  "alert_diff_bps": "8",
+  "alert_diff_bps": "12",
   "alert_min_duration_ms": 0,
   "alert_min_edge_bps": "5.0",
   "binance_idle_reconnect_ms": 10000,
   "binance_ws": "wss://fstream.binance.com/stream",
-  "confirm_bps": "3",
+  "confirm_bps": "5",
   "csv_path": "lag_events.csv",
   "event_cooldown_ms": 1500,
-  "impulse_bps": "5",
+  "impulse_bps": "8",
   "impulse_window_ms": 1000,
   "max_lag_ms": 500,
   "max_quote_age_ms": 2000,
@@ -30,8 +30,9 @@
   "telegram_login_password": "",
   "telegram_subscribers_path": "telegram_subscribers.json",
   "trade_enabled": true,
-  "trade_leverage": 14,
+  "trade_leverage": 5,
   "trade_notional_usdt": "100",
   "trade_timeout_ms": 5000,
-  "trade_vol": "1"
+  "trade_vol": "1",
+  "dashboard_bind": "0.0.0.0:8787"
 }
