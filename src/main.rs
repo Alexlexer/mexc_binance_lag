@@ -1647,31 +1647,35 @@ struct TradeStats {
 
 async fn trade_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     // CSV columns: utc,symbol,direction,lag_ms,entry_bid,entry_ask,exit_bid,exit_ask,
-    //              entry_spread_bps,exit_spread_bps,gross_cross_bps,fees_bps,net_cross_bps,estimated_pnl_usdt,...
+    //              entry_spread_bps,exit_spread_bps,gross_cross_bps,...
+    // Recompute PnL from gross_cross_bps with correct 6 bps fee (taker entry + 0 maker exit).
+    // The pre-baked estimated_pnl_usdt column uses 12 bps (both taker) which is wrong for altcoins.
+    const ALTCOIN_FEE_BPS: f64 = 6.0;
     let path = state.slippage_csv_path.as_str();
+    let notional = state.live_cfg.read().await.trade_notional_usdt
+        .to_string().parse::<f64>().unwrap_or(300.0);
 
-    struct Row { gross: f64, pnl: f64 }
-    let rows: Vec<Row> = std::fs::read_to_string(path)
+    let gross_values: Vec<f64> = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .skip(1)
         .filter_map(|line| {
             let cols: Vec<&str> = line.split(',').collect();
             if MAJOR_SYMBOLS.contains(cols.get(1)?) { return None; }
-            let gross = cols.get(10)?.parse::<f64>().ok()?;
-            let pnl = cols.get(13)?.parse::<f64>().ok()?;
-            Some(Row { gross, pnl })
+            cols.get(10)?.parse::<f64>().ok()
         })
         .collect();
 
-    let count = rows.len();
+    let count = gross_values.len();
     if count == 0 {
         return Json(TradeStats { trade_count: 0, avg_gross_bps: None, cumulative_pnl_usdt: 0.0, winning_trades: 0 });
     }
 
-    let avg_gross = rows.iter().map(|r| r.gross).sum::<f64>() / count as f64;
-    let cum_pnl: f64 = rows.iter().map(|r| r.pnl).sum();
-    let winning = rows.iter().filter(|r| r.pnl > 0.0).count();
+    let avg_gross = gross_values.iter().sum::<f64>() / count as f64;
+    let cum_pnl: f64 = gross_values.iter()
+        .map(|&g| notional * (g - ALTCOIN_FEE_BPS) / 10_000.0)
+        .sum();
+    let winning = gross_values.iter().filter(|&&g| g > ALTCOIN_FEE_BPS).count();
 
     Json(TradeStats {
         trade_count: count,
