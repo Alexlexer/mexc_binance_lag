@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lag Monitor — Binance → MEXC</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg:        oklch(0.985 0.005 90);
+      --surface:   oklch(1 0 0);
+      --surface-2: oklch(0.965 0.006 90);
+      --ink:       oklch(0.18 0.012 260);
+      --ink-2:     oklch(0.42 0.012 260);
+      --ink-3:     oklch(0.62 0.010 260);
+      --hair:      oklch(0.90 0.008 260);
+      --hair-2:    oklch(0.94 0.006 260);
+      --accent:    #E26A3A;
+      --accent-ink: #ffffff;
+      --pos:       oklch(0.58 0.14 150);
+      --neg:       oklch(0.60 0.18 25);
+      --warn:      oklch(0.72 0.14 75);
+      --row-pos:   oklch(0.97 0.03 150);
+      --row-warn:  oklch(0.97 0.04 80);
+      --pad-y: 14px;
+      --pad-x: 12px;
+      --radius: 4px;
+      --radius-lg: 6px;
+      --hair-w: 1px;
+    }
+    html[data-theme="dark"] {
+      --bg:        oklch(0.16 0.012 260);
+      --surface:   oklch(0.20 0.014 260);
+      --surface-2: oklch(0.225 0.014 260);
+      --ink:       oklch(0.97 0.005 90);
+      --ink-2:     oklch(0.78 0.010 260);
+      --ink-3:     oklch(0.60 0.012 260);
+      --hair:      oklch(0.30 0.014 260);
+      --hair-2:    oklch(0.26 0.014 260);
+      --row-pos:   oklch(0.28 0.05 150);
+      --row-warn:  oklch(0.30 0.07 80);
+    }
+    html[data-density="compact"] { --pad-y: 9px; --pad-x: 10px; }
+    html[data-density="comfy"]   { --pad-y: 18px; --pad-x: 16px; }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font-family: 'IBM Plex Sans', system-ui, -apple-system, Segoe UI, Arial, sans-serif;
+      font-size: 14px; -webkit-font-smoothing: antialiased;
+    }
+    .mono, input[type=number], input[type=password], input[type=text] {
+      font-family: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Top bar */
+    .topbar {
+      display: flex; align-items: center; gap: 24px;
+      padding: 14px 24px;
+      border-bottom: var(--hair-w) solid var(--hair);
+      background: var(--surface);
+      position: sticky; top: 0; z-index: 5;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 28px; height: 28px; background: var(--ink); color: var(--bg);
+      display: grid; place-items: center;
+      font-family: 'IBM Plex Mono'; font-weight: 600; font-size: 13px;
+      border-radius: var(--radius); letter-spacing: -.02em;
+    }
+    .brand-mark .accent { color: var(--accent); }
+    .brand-title { font-weight: 600; font-size: 15px; letter-spacing: -.01em; }
+    .brand-sub {
+      color: var(--ink-3); font-size: 12px; margin-top: 1px;
+      font-family: 'IBM Plex Mono'; letter-spacing: -.01em;
+    }
+    .topbar-spacer { flex: 1; }
+    .topbar-meta { display: flex; gap: 18px; align-items: center; font-size: 12px; color: var(--ink-2); flex-wrap: wrap; }
+    .topbar-meta .mono { color: var(--ink); }
+
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 9px 4px 8px;
+      border: var(--hair-w) solid var(--hair);
+      border-radius: 999px;
+      font-size: 11px; font-weight: 500;
+      color: var(--ink-2); background: var(--surface);
+      letter-spacing: .02em; text-transform: uppercase;
+    }
+    .pill .dot { width: 6px; height: 6px; border-radius: 999px; background: var(--ink-3); }
+    .pill.live { color: var(--pos); border-color: color-mix(in oklch, var(--pos), transparent 70%); }
+    .pill.live .dot { background: var(--pos); animation: pulse 1.6s infinite; }
+    .pill.warn { color: var(--warn); border-color: color-mix(in oklch, var(--warn), transparent 70%); }
+    .pill.warn .dot { background: var(--warn); }
+    .pill.err  { color: var(--neg); border-color: color-mix(in oklch, var(--neg), transparent 70%); }
+    .pill.err .dot { background: var(--neg); }
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+
+    .btn {
+      font-family: inherit; font-size: 13px; font-weight: 500;
+      padding: 7px 14px;
+      background: var(--surface); color: var(--ink);
+      border: var(--hair-w) solid var(--hair);
+      border-radius: var(--radius); cursor: pointer;
+      transition: all .12s ease;
+    }
+    .btn:hover { border-color: var(--ink-3); }
+    .btn-primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+    .btn-primary:hover { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+    .btn-ghost { background: transparent; }
+    .btn-icon { padding: 6px 8px; }
+
+    /* Theme toggle group */
+    .seg {
+      display: inline-flex; padding: 2px;
+      background: var(--surface-2); border-radius: var(--radius);
+      border: var(--hair-w) solid var(--hair);
+    }
+    .seg button {
+      font-family: inherit; font-size: 12px; font-weight: 500;
+      padding: 4px 10px;
+      background: transparent; border: 0; color: var(--ink-2);
+      cursor: pointer; border-radius: 2px;
+    }
+    .seg button.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px oklch(0 0 0 / .06); }
+
+    /* Page */
+    main { padding: 28px 24px 80px; max-width: 1480px; margin: 0 auto; }
+    .section-title {
+      display: flex; align-items: center; gap: 12px;
+      margin: 0 0 12px;
+      font-size: 11px; font-weight: 600;
+      letter-spacing: .14em; text-transform: uppercase;
+      color: var(--ink-3);
+    }
+    .section-title .accent-bar { width: 16px; height: 2px; background: var(--accent); border-radius: 2px; }
+    .section-title .mono { color: var(--ink-3); text-transform: none; letter-spacing: 0; }
+
+    /* Config strip */
+    .config {
+      display: flex; flex-wrap: wrap; gap: 0;
+      background: var(--surface);
+      border: var(--hair-w) solid var(--hair);
+      border-radius: var(--radius-lg);
+      margin-bottom: 16px; overflow: hidden;
+    }
+    .cfg-cell {
+      display: flex; flex-direction: column; gap: 4px;
+      padding: 12px 16px;
+      border-right: var(--hair-w) solid var(--hair);
+      min-width: 110px; flex: 1 1 auto;
+    }
+    .cfg-cell:last-child { border-right: 0; }
+    .cfg-label {
+      font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+      color: var(--ink-3); font-weight: 500;
+    }
+    .cfg-cell input[type=number], .cfg-cell input[type=text], .cfg-cell input[type=password] {
+      background: transparent; border: 0; padding: 0; color: var(--ink);
+      font-size: 15px; font-weight: 500; outline: none; width: 100%;
+    }
+    .cfg-cell.toggle { min-width: 130px; }
+    .cfg-toggle {
+      display: inline-flex; align-items: center; gap: 8px; font-size: 13px;
+      color: var(--ink); cursor: pointer; user-select: none;
+    }
+    .switch {
+      position: relative; width: 32px; height: 18px;
+      background: var(--hair); border-radius: 999px; transition: background .15s;
+    }
+    .switch::after {
+      content: ''; position: absolute; left: 2px; top: 2px;
+      width: 14px; height: 14px; background: var(--surface); border-radius: 999px;
+      transition: transform .15s; box-shadow: 0 1px 2px oklch(0 0 0 / .15);
+    }
+    input.sw { display: none; }
+    input.sw:checked + .switch { background: var(--accent); }
+    input.sw:checked + .switch::after { transform: translateX(14px); }
+    .cfg-actions {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 16px; margin-left: auto;
+    }
+    .cfg-status { font-size: 12px; color: var(--pos); min-width: 60px; font-family: 'IBM Plex Mono'; }
+    .cfg-status.err { color: var(--neg); }
+
+    /* KPI tiles */
+    .kpis {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+      border: var(--hair-w) solid var(--hair);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      overflow: hidden; margin-bottom: 32px;
+    }
+    .kpi { padding: 22px 24px; border-right: var(--hair-w) solid var(--hair); position: relative; }
+    .kpi:last-child { border-right: 0; }
+    .kpi-label {
+      font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+      color: var(--ink-3); font-weight: 500; margin-bottom: 12px;
+    }
+    .kpi-value {
+      font-family: 'IBM Plex Mono'; font-size: 30px; font-weight: 500;
+      letter-spacing: -.02em; color: var(--ink); line-height: 1;
+      display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    }
+    .kpi-unit { font-size: 13px; color: var(--ink-3); font-weight: 400; }
+    .kpi-delta {
+      margin-top: 10px; font-size: 12px; color: var(--ink-2);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .kpi-delta.pos { color: var(--pos); }
+    .kpi-delta.neg { color: var(--neg); }
+
+    /* Grid card */
+    .grid-card {
+      background: var(--surface);
+      border: var(--hair-w) solid var(--hair);
+      border-radius: var(--radius-lg);
+      overflow: hidden; margin-bottom: 24px;
+    }
+    .grid-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: var(--hair-w) solid var(--hair);
+      gap: 12px; flex-wrap: wrap;
+    }
+    .grid-header h3 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -.005em; }
+    .grid-header .right { display: flex; gap: 10px; align-items: center; }
+
+    /* Pairs table */
+    .table-wrap { overflow-x: auto; }
+    table.pairs { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.pairs th, table.pairs td {
+      padding: var(--pad-y) var(--pad-x);
+      text-align: right;
+      border-bottom: var(--hair-w) solid var(--hair-2);
+      white-space: nowrap;
+    }
+    table.pairs tr:last-child td { border-bottom: 0; }
+    table.pairs th {
+      font-size: 10px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase;
+      color: var(--ink-3); background: var(--surface);
+      position: sticky; top: 0;
+      border-bottom: var(--hair-w) solid var(--hair);
+    }
+    table.pairs th:first-child, table.pairs td:first-child {
+      text-align: left; padding-left: 20px;
+    }
+    table.pairs th:last-child, table.pairs td:last-child { padding-right: 20px; }
+    table.pairs td { font-family: 'IBM Plex Mono'; color: var(--ink); }
+    table.pairs td.sym { font-family: 'IBM Plex Sans'; font-weight: 600; }
+    table.pairs td.muted { color: var(--ink-3); }
+    table.pairs tr.hot td { background: var(--row-pos); }
+    table.pairs tr.pending td { background: var(--row-warn); }
+    .delta-pos { color: var(--pos); font-weight: 500; }
+    .delta-neg { color: var(--neg); font-weight: 500; }
+
+    .sym-row { display: flex; align-items: center; gap: 10px; }
+    .sym-tag {
+      width: 22px; height: 22px; border-radius: 4px;
+      display: grid; place-items: center;
+      background: var(--surface-2);
+      font-family: 'IBM Plex Mono'; font-size: 9px; font-weight: 600;
+      color: var(--ink-2);
+      border: var(--hair-w) solid var(--hair);
+    }
+    .sym-sub { color: var(--ink-3); font-size: 11px; font-weight: 400; }
+
+    /* Card grid variant */
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 0; }
+    .card-cell {
+      padding: 20px;
+      border-right: var(--hair-w) solid var(--hair-2);
+      border-bottom: var(--hair-w) solid var(--hair-2);
+    }
+    .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .card-sym { font-weight: 600; font-size: 15px; }
+    .card-prices { display: flex; gap: 16px; margin-bottom: 14px; }
+    .card-px { flex: 1; min-width: 0; }
+    .card-px-label { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 4px; }
+    .card-px-val { font-family: 'IBM Plex Mono'; font-size: 18px; font-weight: 500; }
+    .card-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; font-size: 12px; margin: 0; }
+    .card-meta dt { color: var(--ink-3); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .card-meta dd { margin: 0; font-family: 'IBM Plex Mono'; }
+
+    /* Login overlay */
+    .overlay {
+      position: fixed; inset: 0;
+      background: oklch(0.18 0.012 260 / .55);
+      backdrop-filter: blur(8px);
+      display: none; place-items: center; z-index: 50;
+    }
+    .overlay.active { display: grid; }
+    .login {
+      background: var(--surface);
+      border: var(--hair-w) solid var(--hair);
+      border-radius: var(--radius-lg);
+      padding: 36px 40px; width: 360px;
+    }
+    .login h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
+    .login p  { margin: 0 0 24px; color: var(--ink-3); font-size: 13px; }
+    .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+    .field label {
+      font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+      color: var(--ink-3); font-weight: 500;
+    }
+    .field input {
+      background: var(--surface-2); border: var(--hair-w) solid var(--hair);
+      border-radius: var(--radius); padding: 10px 12px;
+      font-family: 'IBM Plex Sans'; font-size: 14px; color: var(--ink);
+      outline: none; transition: border-color .12s;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .login-err { color: var(--neg); font-size: 13px; min-height: 18px; margin-top: 10px; }
+
+    @media (max-width: 1100px) {
+      .kpis { grid-template-columns: repeat(2, 1fr); }
+      .kpi:nth-child(2) { border-right: 0; }
+      .kpi:nth-child(1), .kpi:nth-child(2) { border-bottom: var(--hair-w) solid var(--hair); }
+    }
+    @media (max-width: 720px) {
+      .topbar-meta { display: none; }
+      .kpis { grid-template-columns: 1fr; }
+      .kpi { border-right: 0; border-bottom: var(--hair-w) solid var(--hair); }
+      .kpi:last-child { border-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="overlay" id="loginOverlay">
+    <div class="login">
+      <h2>Вход в монитор</h2>
+      <p>Доступ к панели управления и торговым ключам</p>
+      <div class="field">
+        <label>Логин</label>
+        <input type="text" id="loginUser" autocomplete="username" />
+      </div>
+      <div class="field">
+        <label>Пароль</label>
+        <input type="password" id="loginPass" autocomplete="current-password" />
+      </div>
+      <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="doLogin()">Войти</button>
+      <div class="login-err" id="loginErr"></div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">L<span class="accent">·</span>M</div>
+      <div>
+        <div class="brand-title">Lag Monitor</div>
+        <div class="brand-sub">binance → mexc · perp</div>
+      </div>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-meta">
+      <span class="pill" id="statusPill"><span class="dot"></span><span id="statusText">connecting</span></span>
+      <span>обновлено <span class="mono" id="updated">—</span></span>
+      <span id="thresholds" class="mono"></span>
+    </div>
+    <div class="seg" id="themeSeg">
+      <button data-theme="light">Light</button>
+      <button data-theme="dark">Dark</button>
+    </div>
+    <button class="btn btn-ghost" onclick="doLogout()">Выйти</button>
+  </header>
+
+  <main>
+    <div class="section-title">
+      <span class="accent-bar"></span>
+      <span>Конфигурация</span>
+      <span class="mono">· live params</span>
+    </div>
+    <div class="config">
+      <div class="cfg-cell">
+        <div class="cfg-label">Margin · usdt</div>
+        <input id="cfgMargin" type="number" min="1" step="10" />
+      </div>
+      <div class="cfg-cell">
+        <div class="cfg-label">Leverage</div>
+        <input id="cfgLeverage" type="number" min="1" max="200" step="1" />
+      </div>
+      <div class="cfg-cell">
+        <div class="cfg-label">Impulse · bps</div>
+        <input id="cfgImpulse" type="number" min="0.1" step="0.1" />
+      </div>
+      <div class="cfg-cell">
+        <div class="cfg-label">Confirm · bps</div>
+        <input id="cfgConfirm" type="number" min="0.1" step="0.1" />
+      </div>
+      <div class="cfg-cell">
+        <div class="cfg-label">Max lag · ms</div>
+        <input id="cfgMaxLag" type="number" min="100" step="100" />
+      </div>
+      <div class="cfg-cell">
+        <div class="cfg-label">Alert diff · bps</div>
+        <input id="cfgAlert" type="number" min="0.1" step="0.1" />
+      </div>
+      <div class="cfg-cell toggle">
+        <div class="cfg-label">Auto-trade</div>
+        <label class="cfg-toggle">
+          <input type="checkbox" class="sw" id="cfgTrade" />
+          <span class="switch"></span>
+          <span class="mono" style="font-size:13px" id="cfgTradeLbl">disabled</span>
+        </label>
+      </div>
+      <div class="cfg-actions">
+        <span class="cfg-status" id="cfgStatus"></span>
+        <button class="btn btn-primary" onclick="saveConfig()">Apply</button>
+      </div>
+    </div>
+
+    <div class="config" style="margin-bottom:28px">
+      <div class="cfg-cell" style="flex:2">
+        <div class="cfg-label">MEXC API key</div>
+        <input id="cfgApiKey" type="password" placeholder="••••••••" />
+      </div>
+      <div class="cfg-cell" style="flex:2">
+        <div class="cfg-label">MEXC secret</div>
+        <input id="cfgApiSecret" type="password" placeholder="••••••••" />
+      </div>
+      <div class="cfg-actions">
+        <span class="cfg-status" id="keysStatus"></span>
+        <button class="btn" onclick="saveKeys()">Set keys</button>
+      </div>
+    </div>
+
+    <div class="section-title">
+      <span class="accent-bar"></span>
+      <span>Состояние потоков</span>
+      <span class="mono">· last tick</span>
+    </div>
+    <section class="kpis">
+      <div class="kpi">
+        <div class="kpi-label">Тики Binance</div>
+        <div class="kpi-value mono" id="binanceQuotes">—</div>
+        <div class="kpi-delta" id="binanceStreams">— streams</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Тики MEXC</div>
+        <div class="kpi-value mono" id="mexcQuotes">—</div>
+        <div class="kpi-delta">single stream</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Подтв. события</div>
+        <div class="kpi-value mono" id="matched">—<span class="kpi-unit" id="impulses">/ —</span></div>
+        <div class="kpi-delta" id="matchRate">— match rate</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Средняя задержка</div>
+        <div class="kpi-value mono" id="avgLag">—<span class="kpi-unit">ms</span></div>
+        <div class="kpi-delta" id="lagSub">p95 —</div>
+      </div>
+    </section>
+
+    <div class="section-title">
+      <span class="accent-bar"></span>
+      <span>Пары</span>
+      <span class="mono" id="pairsCount">· — symbols</span>
+    </div>
+    <div class="grid-card">
+      <div class="grid-header">
+        <h3>Текущие котировки и задержки</h3>
+        <div class="right">
+          <div class="seg" id="layoutSeg">
+            <button data-layout="table" class="active">Таблица</button>
+            <button data-layout="cards">Карточки</button>
+          </div>
+          <div class="seg" id="densitySeg">
+            <button data-density="compact">Compact</button>
+            <button data-density="regular" class="active">Regular</button>
+            <button data-density="comfy">Comfy</button>
+          </div>
+        </div>
+      </div>
+      <div id="pairsBody"></div>
+    </div>
+
+    <div class="section-title">
+      <span class="accent-bar"></span>
+      <span>Симуляция торговли</span>
+      <span class="mono">· альткоины</span>
+    </div>
+    <div class="grid-card" id="tradeStatsCard" hidden>
+      <div class="grid-header">
+        <h3>Tradeable события из slippage_events.csv</h3>
+        <div class="right">
+          <span style="font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">min lag</span>
+          <div class="seg" id="minLagSeg">
+            <button data-lag="100">100ms</button>
+            <button data-lag="200" class="active">200ms</button>
+            <button data-lag="300">300ms</button>
+            <button data-lag="500">500ms</button>
+          </div>
+        </div>
+      </div>
+      <div class="kpis" style="border:0;border-radius:0;margin:0">
+        <div class="kpi">
+          <div class="kpi-label">Событий</div>
+          <div class="kpi-value mono" id="stTotal">—</div>
+          <div class="kpi-delta">всего обнаружено</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Tradeable</div>
+          <div class="kpi-value mono" id="stTrades">—</div>
+          <div class="kpi-delta" id="stTradesPct">— conversion</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Avg net</div>
+          <div class="kpi-value mono" id="stNet">—<span class="kpi-unit">bps</span></div>
+          <div class="kpi-delta" id="stGross">gross —</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Cum. PnL</div>
+          <div class="kpi-value mono" id="stCumPnl">—<span class="kpi-unit">usdt</span></div>
+          <div class="kpi-delta">sim · fee <span class="mono" id="stFee">—</span></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    'use strict';
+
+    const TOKEN_KEY = 'lagmon_token';
+    const PREF_KEY  = 'lagmon_prefs';
+
+    // ── Prefs (theme / layout / density / min-lag) ─────────────────
+    const prefs = Object.assign(
+      { theme: 'light', layout: 'table', density: 'regular', minLag: 200 },
+      JSON.parse(localStorage.getItem(PREF_KEY) || '{}')
+    );
+    function savePrefs() { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); }
+    function applyPrefs() {
+      document.documentElement.dataset.theme = prefs.theme;
+      document.documentElement.dataset.density = prefs.density;
+      document.querySelectorAll('#themeSeg button').forEach(b =>
+        b.classList.toggle('active', b.dataset.theme === prefs.theme));
+      document.querySelectorAll('#layoutSeg button').forEach(b =>
+        b.classList.toggle('active', b.dataset.layout === prefs.layout));
+      document.querySelectorAll('#densitySeg button').forEach(b =>
+        b.classList.toggle('active', b.dataset.density === prefs.density));
+      document.querySelectorAll('#minLagSeg button').forEach(b =>
+        b.classList.toggle('active', parseInt(b.dataset.lag) === prefs.minLag));
+    }
+    applyPrefs();
+    document.getElementById('themeSeg').addEventListener('click', (e) => {
+      const t = e.target.closest('button'); if (!t) return;
+      prefs.theme = t.dataset.theme; savePrefs(); applyPrefs();
+    });
+    document.getElementById('layoutSeg').addEventListener('click', (e) => {
+      const t = e.target.closest('button'); if (!t) return;
+      prefs.layout = t.dataset.layout; savePrefs(); applyPrefs(); renderPairs();
+    });
+    document.getElementById('densitySeg').addEventListener('click', (e) => {
+      const t = e.target.closest('button'); if (!t) return;
+      prefs.density = t.dataset.density; savePrefs(); applyPrefs();
+    });
+    document.getElementById('minLagSeg').addEventListener('click', (e) => {
+      const t = e.target.closest('button'); if (!t) return;
+      prefs.minLag = parseInt(t.dataset.lag); savePrefs(); applyPrefs(); loadTradeStats();
+    });
+
+    // ── Auth ───────────────────────────────────────────────────────
+    const tok = () => sessionStorage.getItem(TOKEN_KEY);
+    const authH = () => { const t = tok(); return t ? { 'Authorization': 'Bearer ' + t } : {}; };
+    function showLogin() {
+      const o = document.getElementById('loginOverlay');
+      const wasActive = o.classList.contains('active');
+      o.classList.add('active');
+      if (!wasActive) setTimeout(() => document.getElementById('loginUser').focus(), 50);
+    }
+    function hideLogin() { document.getElementById('loginOverlay').classList.remove('active'); }
+    function handle401() { sessionStorage.removeItem(TOKEN_KEY); showLogin(); }
+
+    async function doLogin() {
+      const u = document.getElementById('loginUser').value.trim();
+      const p = document.getElementById('loginPass').value;
+      const err = document.getElementById('loginErr');
+      err.textContent = '';
+      if (!u || !p) { err.textContent = 'Заполните все поля'; return; }
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: u, password: p })
+        });
+        if (r.ok) {
+          const d = await r.json();
+          sessionStorage.setItem(TOKEN_KEY, d.token);
+          document.getElementById('loginPass').value = '';
+          hideLogin();
+          loadConfig();
+          refresh();
+          loadTradeStats();
+        } else if (r.status === 429) {
+          err.textContent = 'Слишком много попыток. Подождите 15 минут.';
+        } else {
+          err.textContent = 'Неверный логин или пароль';
+        }
+      } catch { err.textContent = 'Ошибка соединения'; }
+    }
+
+    function doLogout() {
+      const t = tok();
+      if (t) fetch('/api/logout', { method: 'POST', headers: authH() }).catch(() => {});
+      sessionStorage.removeItem(TOKEN_KEY);
+      showLogin();
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && document.getElementById('loginOverlay').classList.contains('active')) doLogin();
+    });
+
+    // ── Helpers ────────────────────────────────────────────────────
+    const fmt = (v, suf = '') => (v === null || v === undefined || v === '') ? '—' : `${v}${suf}`;
+    const num = (v) => (v === null || v === undefined || v === '') ? null : parseFloat(v);
+    function sym2tag(s) { return s.split('_')[0].slice(0, 4); }
+    function sym2display(s) { return s.replace('_', '/'); }
+
+    function setPill(kind, text) {
+      const p = document.getElementById('statusPill');
+      p.className = 'pill ' + kind;
+      document.getElementById('statusText').textContent = text;
+    }
+
+    // ── Config ─────────────────────────────────────────────────────
+    async function loadConfig() {
+      const r = await fetch('/api/config', { headers: authH() }).catch(() => null);
+      if (!r) return;
+      if (r.status === 401) { handle401(); return; }
+      const c = await r.json();
+      document.getElementById('cfgMargin').value = c.trade_margin_usdt;
+      document.getElementById('cfgLeverage').value = c.trade_leverage;
+      document.getElementById('cfgImpulse').value = c.impulse_bps;
+      document.getElementById('cfgConfirm').value = c.confirm_bps;
+      document.getElementById('cfgMaxLag').value = c.max_lag_ms;
+      document.getElementById('cfgAlert').value = c.alert_diff_bps;
+      document.getElementById('cfgTrade').checked = c.trade_enabled;
+      document.getElementById('cfgTradeLbl').textContent = c.trade_enabled ? 'enabled' : 'disabled';
+      loadKeys();
+    }
+
+    document.getElementById('cfgTrade').addEventListener('change', (e) => {
+      document.getElementById('cfgTradeLbl').textContent = e.target.checked ? 'enabled' : 'disabled';
+    });
+
+    async function saveConfig() {
+      const body = {
+        trade_margin_usdt: parseFloat(document.getElementById('cfgMargin').value),
+        trade_leverage: parseInt(document.getElementById('cfgLeverage').value),
+        impulse_bps: parseFloat(document.getElementById('cfgImpulse').value),
+        confirm_bps: parseFloat(document.getElementById('cfgConfirm').value),
+        max_lag_ms: parseInt(document.getElementById('cfgMaxLag').value),
+        alert_diff_bps: parseFloat(document.getElementById('cfgAlert').value),
+        trade_enabled: document.getElementById('cfgTrade').checked,
+      };
+      const r = await fetch('/api/config', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, authH()),
+        body: JSON.stringify(body)
+      }).catch(() => null);
+      if (!r) return;
+      if (r.status === 401) { handle401(); return; }
+      const st = document.getElementById('cfgStatus');
+      st.textContent = r.ok ? 'saved ✓' : 'error ✗';
+      st.classList.toggle('err', !r.ok);
+      setTimeout(() => { st.textContent = ''; st.classList.remove('err'); }, 2500);
+    }
+
+    async function loadKeys() {
+      const r = await fetch('/api/keys', { headers: authH() }).catch(() => null);
+      if (!r || r.status === 401) return;
+      const d = await r.json();
+      const st = document.getElementById('keysStatus');
+      st.textContent = d.active ? 'active ✓' : 'not set';
+      st.classList.toggle('err', !d.active);
+    }
+
+    async function saveKeys() {
+      const key = document.getElementById('cfgApiKey').value.trim();
+      const secret = document.getElementById('cfgApiSecret').value.trim();
+      const st = document.getElementById('keysStatus');
+      st.textContent = '';
+      if (!key || !secret) { st.textContent = 'fill both fields'; st.classList.add('err'); return; }
+      const r = await fetch('/api/keys', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, authH()),
+        body: JSON.stringify({ mexc_api_key: key, mexc_api_secret: secret })
+      }).catch(() => null);
+      if (!r || r.status === 401) { handle401(); return; }
+      if (r.ok) {
+        document.getElementById('cfgApiKey').value = '';
+        document.getElementById('cfgApiSecret').value = '';
+        st.textContent = 'active ✓'; st.classList.remove('err');
+      } else {
+        st.textContent = 'error ✗'; st.classList.add('err');
+      }
+    }
+
+    // ── State refresh ──────────────────────────────────────────────
+    let lastRows = [];
+
+    async function refresh() {
+      const r = await fetch('/api/state', { cache: 'no-store', headers: authH() }).catch(() => null);
+      if (!r) { setPill('err', 'offline'); return; }
+      if (r.status === 401) { handle401(); return; }
+      const data = await r.json();
+      const rows = data.symbols || [];
+      lastRows = rows;
+
+      setPill('live', 'live');
+      document.getElementById('updated').textContent = data.updated_at || '—';
+      document.getElementById('thresholds').textContent =
+        `imp ${data.impulse_bps} bps · conf ${data.confirm_bps} bps · max ${data.max_lag_ms} ms`;
+
+      const sumBinance = rows.reduce((a, r) => a + (r.binance_quotes || 0), 0);
+      const sumMexc    = rows.reduce((a, r) => a + (r.mexc_quotes || 0), 0);
+      const sumImp     = rows.reduce((a, r) => a + (r.impulses || 0), 0);
+      const sumMatched = rows.reduce((a, r) => a + (r.matched || 0), 0);
+
+      document.getElementById('binanceQuotes').textContent = sumBinance.toLocaleString('en-US');
+      document.getElementById('binanceStreams').textContent = `${rows.length} streams`;
+      document.getElementById('mexcQuotes').textContent = sumMexc.toLocaleString('en-US');
+      document.getElementById('matched').textContent = sumMatched;
+      document.getElementById('impulses').textContent = `/ ${sumImp} imp.`;
+      const pct = sumImp > 0 ? Math.round(sumMatched / sumImp * 100) : 0;
+      const mr = document.getElementById('matchRate');
+      mr.textContent = sumImp > 0 ? `${pct}% match rate` : 'no impulses yet';
+      mr.classList.toggle('pos', pct >= 50);
+      mr.classList.toggle('neg', sumImp > 0 && pct < 50);
+
+      const lags = rows.map(r => r.avg_lag_ms).filter(v => v !== null && v !== undefined);
+      const p95s = rows.map(r => r.p95_lag_ms).filter(v => v !== null && v !== undefined);
+      const avgLag = lags.length ? Math.round(lags.reduce((a, b) => a + b, 0) / lags.length) : null;
+      const p95 = p95s.length ? Math.max(...p95s) : null;
+      document.getElementById('avgLag').innerHTML = avgLag !== null
+        ? `${avgLag}<span class="kpi-unit">ms</span>` : '—';
+      document.getElementById('lagSub').textContent = p95 !== null ? `p95 ${p95} ms` : 'p95 —';
+
+      document.getElementById('pairsCount').textContent = `· ${rows.length} symbols`;
+      renderPairs();
+    }
+
+    function renderPairs() {
+      const rows = lastRows;
+      const body = document.getElementById('pairsBody');
+      if (prefs.layout === 'table') body.innerHTML = renderTable(rows);
+      else                          body.innerHTML = renderCards(rows);
+    }
+
+    function renderTable(rows) {
+      const head = `
+        <thead><tr>
+          <th>Пара</th><th>Binance</th><th>MEXC</th><th>Δ $</th><th>Δ bps</th>
+          <th>Imp.</th><th>Match</th><th>Avg ms</th><th>p95</th>
+          <th>Net fee</th><th>Net 0</th><th>PnL 0</th><th>Pending</th>
+        </tr></thead>`;
+      const body = rows.map(r => {
+        const cls = (r.matched && r.matched > 0 ? 'hot ' : '') + (r.pending ? 'pending' : '');
+        const diffBps = num(r.price_diff_bps);
+        const diffCls = diffBps === null ? 'muted' : (diffBps > 0 ? 'delta-pos' : diffBps < 0 ? 'delta-neg' : 'muted');
+        const netFee = num(r.net_fee_bps);
+        const netFeeCls = netFee === null ? 'muted' : (netFee >= 0 ? 'delta-pos' : 'delta-neg');
+        const net0 = num(r.net_zero_fee_bps);
+        const net0Cls = net0 === null ? 'muted' : (net0 >= 0 ? 'delta-pos' : 'delta-neg');
+        const pnl0 = num(r.pnl_zero_fee_usdt);
+        const pnl0Cls = pnl0 === null ? 'muted' : (pnl0 >= 0 ? 'delta-pos' : 'delta-neg');
+        const pendingTxt = r.pending === 'UP' ? 'ВВЕРХ' : r.pending === 'DOWN' ? 'ВНИЗ' : '—';
+        return `
+          <tr class="${cls.trim()}">
+            <td class="sym">
+              <div class="sym-row">
+                <div class="sym-tag">${sym2tag(r.symbol)}</div>
+                <div>${sym2display(r.symbol)}<div class="sym-sub">perp</div></div>
+              </div>
+            </td>
+            <td>${fmt(r.binance_mid)}</td>
+            <td>${fmt(r.mexc_mid)}</td>
+            <td class="${diffCls}">${fmt(r.price_diff_usdt)}</td>
+            <td class="${diffCls}">${fmt(r.price_diff_bps)}</td>
+            <td>${r.impulses}</td>
+            <td>${r.matched}</td>
+            <td>${fmt(r.avg_lag_ms)}</td>
+            <td>${fmt(r.p95_lag_ms)}</td>
+            <td class="${netFeeCls}">${fmt(r.net_fee_bps)}</td>
+            <td class="${net0Cls}">${fmt(r.net_zero_fee_bps)}</td>
+            <td class="${pnl0Cls}">${fmt(r.pnl_zero_fee_usdt)}</td>
+            <td class="muted">${pendingTxt}</td>
+          </tr>`;
+      }).join('');
+      return `<div class="table-wrap"><table class="pairs">${head}<tbody>${body}</tbody></table></div>`;
+    }
+
+    function renderCards(rows) {
+      const cards = rows.map(r => {
+        const diffBps = num(r.price_diff_bps);
+        const diffCls = diffBps === null ? '' : (diffBps > 0 ? 'delta-pos' : diffBps < 0 ? 'delta-neg' : '');
+        const pnl0 = num(r.pnl_zero_fee_usdt);
+        const pnl0Cls = pnl0 === null ? '' : (pnl0 >= 0 ? 'delta-pos' : 'delta-neg');
+        const pill = r.pending
+          ? `<span class="pill warn"><span class="dot"></span>${r.pending === 'UP' ? 'pending ↑' : 'pending ↓'}</span>`
+          : (r.matched && r.matched > 0
+            ? '<span class="pill live"><span class="dot"></span>hot</span>'
+            : '<span class="pill"><span class="dot"></span>idle</span>');
+        return `
+          <div class="card-cell">
+            <div class="card-head">
+              <div class="card-sym">${sym2display(r.symbol)}</div>
+              ${pill}
+            </div>
+            <div class="card-prices">
+              <div class="card-px">
+                <div class="card-px-label">Binance</div>
+                <div class="card-px-val">${fmt(r.binance_mid)}</div>
+              </div>
+              <div class="card-px">
+                <div class="card-px-label">MEXC</div>
+                <div class="card-px-val">${fmt(r.mexc_mid)}</div>
+              </div>
+              <div class="card-px">
+                <div class="card-px-label">Δ bps</div>
+                <div class="card-px-val ${diffCls}">${fmt(r.price_diff_bps)}</div>
+              </div>
+            </div>
+            <dl class="card-meta">
+              <dt>Imp / match</dt><dd>${r.impulses} / ${r.matched}</dd>
+              <dt>Avg lag</dt><dd>${fmt(r.avg_lag_ms, ' ms')}</dd>
+              <dt>p95</dt><dd>${fmt(r.p95_lag_ms, ' ms')}</dd>
+              <dt>PnL 0</dt><dd class="${pnl0Cls}">${fmt(r.pnl_zero_fee_usdt)}</dd>
+            </dl>
+          </div>`;
+      }).join('');
+      return `<div class="cards">${cards}</div>`;
+    }
+
+    // ── Trade stats ────────────────────────────────────────────────
+    async function loadTradeStats() {
+      const r = await fetch(`/api/trade-stats?min_lag_ms=${prefs.minLag}`, { headers: authH() })
+        .catch(() => null);
+      if (!r || r.status === 401) return;
+      const d = await r.json();
+      const card = document.getElementById('tradeStatsCard');
+      if (!d || d.total_detected === 0) { card.hidden = true; return; }
+      card.hidden = false;
+      document.getElementById('stTotal').textContent = d.total_detected;
+      const pct = d.total_detected > 0 ? Math.round(d.trade_count / d.total_detected * 100) : 0;
+      document.getElementById('stTrades').textContent = d.trade_count;
+      document.getElementById('stTradesPct').textContent = `${pct}% conversion`;
+
+      const netEl = document.getElementById('stNet');
+      const grossEl = document.getElementById('stGross');
+      if (d.avg_net_bps !== null && d.avg_net_bps !== undefined) {
+        netEl.innerHTML = `${d.avg_net_bps.toFixed(2)}<span class="kpi-unit">bps</span>`;
+        netEl.classList.toggle('delta-pos', d.avg_net_bps >= 0);
+        netEl.classList.toggle('delta-neg', d.avg_net_bps < 0);
+      } else { netEl.innerHTML = `—<span class="kpi-unit">bps</span>`; }
+      grossEl.textContent = d.avg_gross_bps !== null && d.avg_gross_bps !== undefined
+        ? `gross ${d.avg_gross_bps.toFixed(2)} bps` : 'gross —';
+
+      const cumEl = document.getElementById('stCumPnl');
+      if (d.trade_count > 0) {
+        cumEl.innerHTML = `${d.cumulative_pnl_usdt.toFixed(2)}<span class="kpi-unit">usdt</span>`;
+        cumEl.classList.toggle('delta-pos', d.cumulative_pnl_usdt >= 0);
+        cumEl.classList.toggle('delta-neg', d.cumulative_pnl_usdt < 0);
+      } else { cumEl.innerHTML = `—<span class="kpi-unit">usdt</span>`; }
+      document.getElementById('stFee').textContent = `${d.fee_bps} bps`;
+    }
+
+    // ── Boot ───────────────────────────────────────────────────────
+    if (tok()) {
+      loadConfig();
+      refresh();
+      loadTradeStats();
+    } else {
+      showLogin();
+    }
+    setInterval(refresh, 1000);
+    setInterval(loadTradeStats, 30000);
+  </script>
+</body>
+</html>
